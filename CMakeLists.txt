@@ -1474,6 +1474,7 @@ add_library(
   src/library/dao/settingsdao.cpp
   src/library/dao/trackdao.cpp
   src/library/dao/trackschema.cpp
+  src/library/djlib/djlibsidecar.cpp
   src/library/tabledelegates/defaultdelegate.cpp
   src/library/dlgcoverartfullsize.cpp
   src/library/dlgcoverartfullsize.ui
@@ -2880,6 +2881,7 @@ if(BUILD_TESTING)
     src/test/dbconnectionpool_test.cpp
     src/test/dbidtest.cpp
     src/test/directorydaotest.cpp
+    src/test/djlibsidecartest.cpp
     src/test/djlibsettingspathtest.cpp
     src/test/duration_test.cpp
     src/test/durationutiltest.cpp
