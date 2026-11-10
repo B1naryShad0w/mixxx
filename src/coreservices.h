@@ -20,6 +20,7 @@ class ControllerManager;
 class VinylControlManager;
 class TrackCollectionManager;
 class Library;
+class DjlibService;
 class SkinControls;
 class ControlPushButton;
 struct LibraryScanResultSummary;
@@ -141,6 +142,7 @@ class CoreServices : public QObject {
     std::shared_ptr<DbConnectionPool> m_pDbConnectionPool;
     std::shared_ptr<TrackCollectionManager> m_pTrackCollectionManager;
     std::shared_ptr<Library> m_pLibrary;
+    std::shared_ptr<DjlibService> m_pDjlibService; // djlib fork
 
     std::shared_ptr<KeyboardEventFilter> m_pKeyboardEventFilter;
     std::shared_ptr<ConfigObject<ConfigValueKbd>> m_pKbdConfig;

@@ -21,6 +21,7 @@
 #include "engine/bufferscalers/rubberbandworkerpool.h"
 #endif
 #include "library/coverartcache.h"
+#include "library/djlib/djlibservice.h"
 #include "library/library.h"
 #include "library/library_decl.h"
 #include "library/library_prefs.h"
@@ -674,6 +675,18 @@ void CoreServices::initialize(QApplication* pApp) {
         }
     }
 
+    // djlib fork: watch the djlib library folder ([djlib] LibraryPath). After
+    // the music-dir prompt, so registering <lib>/tracks doesn't suppress it.
+    m_pDjlibService = std::make_shared<DjlibService>(pConfig, m_pTrackCollectionManager.get());
+    m_pDjlibService->setTrackLoadedFn([](const TrackPointer& pTrack) {
+        return PlayerInfo::instance().isTrackLoaded(pTrack);
+    });
+    connect(&PlayerInfo::instance(),
+            &PlayerInfo::trackChanged,
+            m_pDjlibService.get(),
+            &DjlibService::slotDeckTrackChanged);
+    m_pDjlibService->start();
+
     emit initializationProgressUpdate(60, tr("controllers"));
     // Initialize controller sub-system,
     // but do not set up controllers until the end of the application startup
@@ -946,6 +959,9 @@ void CoreServices::finalize() {
     CoverArtCache::destroy();
 
     Clipboard::destroy();
+
+    // djlib fork: holds track pointers, uses the library; joins its workers.
+    CLEAR_AND_CHECK_DELETED(m_pDjlibService);
 
     // PlayerManager depends on Engine, SoundManager, VinylControlManager, and Config
     // The player manager has to be deleted before the library to ensure
