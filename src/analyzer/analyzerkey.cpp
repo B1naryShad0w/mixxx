@@ -132,6 +132,10 @@ bool AnalyzerKey::shouldAnalyze(TrackPointer pTrack) const {
 
     const Keys keys = pTrack->getKeys();
     if (keys.getGlobalKey() != mixxx::track::io::key::INVALID) {
+        // djlib fork: keys imported from metadata (djlib sidecars) are final.
+        if (keys.getSource() == mixxx::track::io::key::FILE_METADATA) {
+            return false;
+        }
         QString version = keys.getVersion();
         QString subVersion = keys.getSubVersion();
 

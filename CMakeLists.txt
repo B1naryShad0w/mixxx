@@ -1475,6 +1475,7 @@ add_library(
   src/library/dao/trackdao.cpp
   src/library/dao/trackschema.cpp
   src/library/djlib/djlibcratesync.cpp
+  src/library/djlib/djlibimporter.cpp
   src/library/djlib/djlibsidecar.cpp
   src/library/djlib/djlibstore.cpp
   src/library/tabledelegates/defaultdelegate.cpp
@@ -2968,6 +2969,7 @@ if(BUILD_TESTING)
     set(
       src-mixxx-test
       ${src-mixxx-test}
+      src/test/djlibimportertest.cpp
       src/test/stemtest.cpp
       src/test/steminfotest.cpp
       src/test/stemcontrolobjecttest.cpp
