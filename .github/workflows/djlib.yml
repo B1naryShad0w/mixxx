@@ -3,7 +3,7 @@
 # Mixxx djlib fork CI. Replaces all upstream workflows on this branch.
 # - every push: Linux build + djlib-relevant tests
 # - tag v*: Windows 2022 x64 build, tests, MSI, GitHub Release with the MSI
-# - manual (workflow_dispatch): Linux + Windows build and MSI artifact, no release
+# - manual (workflow_dispatch): Linux + Windows build and MSI artifact, never a release
 # The Windows steps are copied from upstream .github/workflows/build.yml
 # (matrix entry "Windows 2022 x64"); signing, deploy and publishing are dropped.
 
@@ -90,7 +90,7 @@ jobs:
           key: ${{ steps.ccache_cache.outputs.cache-primary-key }}
 
       - name: "Test"
-        run: ctest --timeout 45 -R "${CTEST_TESTS}"
+        run: ctest --timeout 45 --no-tests=error -R "${CTEST_TESTS}"
         working-directory: build
         env:
           GTEST_COLOR: 1
@@ -195,7 +195,7 @@ jobs:
           CXX: cl
 
       - name: "Test"
-        run: ctest --timeout 45 -R "${env:CTEST_TESTS}"
+        run: ctest --timeout 45 --no-tests=error -R "${env:CTEST_TESTS}"
         working-directory: build
         env:
           GTEST_COLOR: 1
@@ -229,7 +229,7 @@ jobs:
           if-no-files-found: error
 
       - name: "Create GitHub Release"
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: build/*.msi

@@ -95,6 +95,8 @@ CmdlineArgs::CmdlineArgs()
           // to QDir::filePath elsewhere in the code. This is candidate for removal.
           // djlib fork: own settings dir side by side with stock Mixxx
           // (%LOCALAPPDATA%\Mixxx-djlib\ on Windows instead of %LOCALAPPDATA%\Mixxx\).
+          // macOS is not a fork target and is NOT fully isolated: a sandboxed build
+          // still runs Sandbox::migrateOldSettings() into stock Mixxx's container.
           m_settingsPath(
                   QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation)
                           .append("/Mixxx-djlib/"))

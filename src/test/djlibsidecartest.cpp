@@ -279,7 +279,7 @@ TEST(DjlibSidecarTest, rejectsWrongTypes) {
             {QStringLiteral("crates"), QJsonValue(QStringLiteral("House"))},
             {QStringLiteral("crates"), QJsonArray{QStringLiteral("crate_x")}},
             {QStringLiteral("crates"), QJsonArray{QJsonObject{{QStringLiteral("name"), "House"}}}},
-            {QStringLiteral("tempo"), QJsonValue(QStringLiteral("swing"))},
+            {QStringLiteral("tempo"), QJsonValue(42)},
             {QStringLiteral("bpm"), QJsonValue(QStringLiteral("124"))},
             {QStringLiteral("bpm"), QJsonValue(0)},
             {QStringLiteral("grid"), QJsonValue(QJsonValue::Null)},
@@ -309,6 +309,9 @@ TEST(DjlibSidecarTest, rejectsWrongTypes) {
 
 TEST(DjlibSidecarTest, rejectsNonFiniteNumbers) {
     // JSON has no NaN/Infinity; an overflowing literal is the only way in.
+    // Qt most likely rejects it already while parsing the JSON, so this mostly
+    // checks that such input fails one way or the other; the isfinite() checks
+    // in the parser are defence in depth.
     QByteArray json = kConstantSample;
     json.replace("\"bpm\": 124.0,", "\"bpm\": 1e999,");
     QString error;
@@ -317,7 +320,59 @@ TEST(DjlibSidecarTest, rejectsNonFiniteNumbers) {
 
     json = kVariableSample;
     json.replace("1.43", "1e999");
+    error.clear();
     EXPECT_FALSE(DjlibSidecar::parse(json, &error));
+    EXPECT_FALSE(error.isEmpty());
+}
+
+TEST(DjlibSidecarTest, unknownTempoValueMeansUnknown) {
+    // Forward compatibility within schema 1: don't reject, don't touch beats.
+    QJsonObject object = sampleObject();
+    object.insert(QStringLiteral("tempo"), QStringLiteral("swing"));
+    QString error;
+    const auto sidecar = parseObject(object, &error);
+    ASSERT_TRUE(sidecar) << error.toStdString();
+    EXPECT_EQ(DjlibSidecar::Tempo::Unknown, sidecar->tempo);
+    EXPECT_FALSE(sidecar->grid);
+    EXPECT_FALSE(sidecar->beatsSeconds);
+    // Everything else still applies.
+    EXPECT_EQ(2, sidecar->crates.size());
+    EXPECT_EQ(QStringLiteral("Am"), sidecar->key);
+    EXPECT_TRUE(sidecar->replayGain);
+    EXPECT_EQ(2, sidecar->cues.size());
+}
+
+TEST(DjlibSidecarTest, skipsUnknownCueTypes) {
+    // Forward compatibility within schema 1: unknown cue kinds are skipped,
+    // even with fields we couldn't validate; known ones are kept.
+    QJsonObject object = sampleObject();
+    QJsonArray cues = object.value(QStringLiteral("cues")).toArray();
+    cues.insert(1,
+            QJsonObject{{QStringLiteral("type"), "loop"},
+                    {QStringLiteral("pos_s"), 1.0},
+                    {QStringLiteral("end_s"), 9.0}});
+    cues.append(QJsonObject{{QStringLiteral("type"), "fancy"}});
+    object.insert(QStringLiteral("cues"), cues);
+    QString error;
+    const auto sidecar = parseObject(object, &error);
+    ASSERT_TRUE(sidecar) << error.toStdString();
+    ASSERT_EQ(2, sidecar->cues.size());
+    EXPECT_EQ(DjlibSidecar::Cue::Type::Main, sidecar->cues[0].type);
+    EXPECT_EQ(DjlibSidecar::Cue::Type::HotCue, sidecar->cues[1].type);
+    EXPECT_EQ(QStringLiteral("1st downbeat"), sidecar->cues[1].label);
+}
+
+TEST(DjlibSidecarTest, defaultConstructedStructsAreZeroed) {
+    const DjlibSidecar::Cue cue;
+    EXPECT_EQ(DjlibSidecar::Cue::Type::Main, cue.type);
+    EXPECT_EQ(0, cue.number);
+    EXPECT_EQ(0.0, cue.posSeconds);
+    const DjlibSidecar::Grid grid;
+    EXPECT_EQ(0.0, grid.firstBeatSeconds);
+    EXPECT_EQ(0.0, grid.bpm);
+    const DjlibSidecar::ReplayGain replayGain;
+    EXPECT_EQ(0.0, replayGain.gainDb);
+    EXPECT_EQ(0.0, replayGain.peak);
 }
 
 TEST(DjlibSidecarTest, validatesVariableBeats) {
@@ -355,7 +410,7 @@ TEST(DjlibSidecarTest, validatesCues) {
     const QList<QJsonValue> badCues = {
             QJsonValue(QJsonValue::Null),
             QJsonArray{QStringLiteral("main")},
-            QJsonArray{QJsonObject{{QStringLiteral("type"), "loop"}, {QStringLiteral("pos_s"), 1.0}}},
+            QJsonArray{QJsonObject{{QStringLiteral("type"), 7}, {QStringLiteral("pos_s"), 1.0}}},
             QJsonArray{QJsonObject{{QStringLiteral("pos_s"), 1.0}}},
             QJsonArray{QJsonObject{{QStringLiteral("type"), "main"}}},
             QJsonArray{QJsonObject{{QStringLiteral("type"), "main"}, {QStringLiteral("pos_s"), -1.0}}},

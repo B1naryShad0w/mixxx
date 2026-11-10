@@ -35,7 +35,9 @@ std::optional<QList<CrateRef>> parseCratesJson(
 ///
 /// Validation: schema must be 1; required fields must be present with the right
 /// type; every number finite; times >= 0; BPMs > 0; `beats_s` strictly
-/// ascending; cue types "main"/"hotcue" (hot cue `number` >= 1). Nullable fields
+/// ascending; known cue types "main"/"hotcue" (hot cue `number` >= 1) are
+/// validated, cues of unknown types are skipped and an unknown tempo value is
+/// treated as "unknown" (forward compatibility within schema 1). Nullable fields
 /// may also be absent (treated as null). Unknown fields are ignored. Beat data
 /// that doesn't belong to the tempo (grid for variable, beats for constant,
 /// both for unknown) is dropped.
@@ -43,17 +45,17 @@ struct DjlibSidecar {
     enum class Tempo {
         Constant, // use `grid`, lock the BPM
         Variable, // use `beatsSeconds`
-        Unknown,  // leave beats to Mixxx's own analysis
+        Unknown,  // leave beats to Mixxx's own analysis (also any unknown value)
     };
 
     struct Grid {
-        double firstBeatSeconds;
-        double bpm;
+        double firstBeatSeconds = 0;
+        double bpm = 0;
     };
 
     struct ReplayGain {
-        double gainDb;
-        double peak; // linear true peak, 1.0 = 0 dBTP
+        double gainDb = 0;
+        double peak = 0; // linear true peak, 1.0 = 0 dBTP
     };
 
     struct Cue {
@@ -61,9 +63,9 @@ struct DjlibSidecar {
             Main,
             HotCue,
         };
-        Type type;
-        int number; // 1-based hot cue number; 0 for the main cue
-        double posSeconds;
+        Type type = Type::Main;
+        int number = 0; // 1-based hot cue number; 0 for the main cue
+        double posSeconds = 0;
         QString label; // empty if none
     };
 
@@ -75,7 +77,9 @@ struct DjlibSidecar {
     qint64 packageVersion = 0;
     QString file;
     QString sha256;
-    QList<djlib::CrateRef> crates; // all crates of the track, unfiltered
+    // All crates of the track, unfiltered. Names may be empty and ids may
+    // repeat; DjlibCrateSync dedupes by id and falls back to the id as name.
+    QList<djlib::CrateRef> crates;
     Tempo tempo = Tempo::Unknown;
     std::optional<double> bpm;
     std::optional<QString> bpmSource;

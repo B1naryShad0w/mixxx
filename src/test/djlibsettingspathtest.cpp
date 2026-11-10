@@ -17,7 +17,8 @@ TEST(DjlibSettingsPathTest, defaultIsSideBySideWithStockMixxx) {
     EXPECT_EQ(QDir::homePath() + QStringLiteral("/.mixxx-djlib/"), path);
 #elif defined(__WINDOWS__) || defined(__APPLE__)
     // %LOCALAPPDATA%\Mixxx-djlib\ on Windows,
-    // ~/Library/Application Support/Mixxx-djlib/ on macOS.
+    // ~/Library/Application Support/Mixxx-djlib/ on macOS (default only; macOS
+    // isn't a fork target and Sandbox::migrateOldSettings() isn't isolated).
     EXPECT_EQ(QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) +
                     QStringLiteral("/Mixxx-djlib/"),
             path);

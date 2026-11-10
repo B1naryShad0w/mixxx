@@ -214,7 +214,9 @@ bool readTempo(const QJsonObject& object, DjlibSidecar::Tempo* pTempo, QString* 
     } else if (tempo == QLatin1String("unknown")) {
         *pTempo = DjlibSidecar::Tempo::Unknown;
     } else {
-        return fail(pError, QStringLiteral("unknown tempo \"%1\"").arg(tempo));
+        // Forward compatibility within schema 1: a tempo kind we don't know
+        // means "don't touch beats", like "unknown".
+        *pTempo = DjlibSidecar::Tempo::Unknown;
     }
     return true;
 }
@@ -287,7 +289,14 @@ bool readReplayGain(const QJsonObject& object,
     return true;
 }
 
-bool readCue(const QJsonValue& value, qsizetype index, DjlibSidecar::Cue* pCue, QString* pError) {
+/// Reads one cue. Sets *pSkip (and returns true) for a cue type this client
+/// doesn't know: those are ignored for forward compatibility within schema 1.
+bool readCue(const QJsonValue& value,
+        qsizetype index,
+        DjlibSidecar::Cue* pCue,
+        bool* pSkip,
+        QString* pError) {
+    *pSkip = false;
     const QString context = QStringLiteral("cues[%1]").arg(index);
     if (!value.isObject()) {
         return fail(pError, QStringLiteral("%1 must be an object").arg(context));
@@ -315,9 +324,8 @@ bool readCue(const QJsonValue& value, qsizetype index, DjlibSidecar::Cue* pCue, 
         }
         pCue->number = static_cast<int>(number);
     } else {
-        return fail(pError,
-                QStringLiteral("%1.type \"%2\" is not a known cue type")
-                        .arg(context, type.toString()));
+        *pSkip = true;
+        return true;
     }
     if (!readNonNegative(object.value(QStringLiteral("pos_s")),
                 context + QStringLiteral(".pos_s"),
@@ -349,10 +357,13 @@ bool readCues(const QJsonObject& object, QList<DjlibSidecar::Cue>* pCues, QStrin
     cues.reserve(array.size());
     for (qsizetype i = 0; i < array.size(); ++i) {
         DjlibSidecar::Cue cue;
-        if (!readCue(array.at(i), i, &cue, pError)) {
+        bool skip;
+        if (!readCue(array.at(i), i, &cue, &skip, pError)) {
             return false;
         }
-        cues.append(std::move(cue));
+        if (!skip) {
+            cues.append(std::move(cue));
+        }
     }
     *pCues = std::move(cues);
     return true;
