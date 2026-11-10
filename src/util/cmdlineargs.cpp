@@ -93,9 +93,11 @@ CmdlineArgs::CmdlineArgs()
 
           // TODO(XXX) Trailing slash not needed anymore as we switches from String::append
           // to QDir::filePath elsewhere in the code. This is candidate for removal.
+          // djlib fork: own settings dir side by side with stock Mixxx
+          // (%LOCALAPPDATA%\Mixxx-djlib\ on Windows instead of %LOCALAPPDATA%\Mixxx\).
           m_settingsPath(
-                  QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation)
-                          .append("/"))
+                  QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation)
+                          .append("/Mixxx-djlib/"))
 #endif
 {
 }

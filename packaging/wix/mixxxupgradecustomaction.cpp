@@ -18,8 +18,11 @@ namespace {
 // {XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}
 constexpr DWORD kMsiGuidBufferSize = 39;
 
-// Mixxx Upgrade GUID — same as CPACK_WIX_UPGRADE_GUID
-constexpr wchar_t kMixxxUpgradeCode[] = L"{921DC99C-4DCF-478D-B950-50685CB9E6BE}";
+// Mixxx Upgrade GUID — same as CPACK_WIX_UPGRADE_GUID.
+// djlib fork: this action is no longer wired into the installer (see
+// CMakeLists.txt); the code is set to the fork's own UpgradeCode anyway so it
+// can never find and remove stock Mixxx if it is re-enabled.
+constexpr wchar_t kMixxxUpgradeCode[] = L"{586EA3F0-5E73-404A-A4BE-C248FAAF8AC0}";
 } // namespace
 
 extern "C"

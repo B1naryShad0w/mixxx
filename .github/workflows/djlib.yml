@@ -1,0 +1,239 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow
+
+# Mixxx djlib fork CI. Replaces all upstream workflows on this branch.
+# - every push: Linux build + djlib-relevant tests
+# - tag v*: Windows 2022 x64 build, tests, MSI, GitHub Release with the MSI
+# - manual (workflow_dispatch): Linux + Windows build and MSI artifact, no release
+# The Windows steps are copied from upstream .github/workflows/build.yml
+# (matrix entry "Windows 2022 x64"); signing, deploy and publishing are dropped.
+
+name: djlib
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CTEST_TESTS: "Djlib|StemInfo|TrackDAO"
+
+jobs:
+  linux:
+    name: Linux build and tests (Ubuntu 24.04)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: "Check out repository"
+        uses: actions/checkout@v7
+        with:
+          # This is necessary for making `git describe` work.
+          fetch-depth: 0
+
+      - name: "Ensure that all tags are fetched"
+        run: git fetch origin --force --tags
+
+      - name: "Set up build environment"
+        run: |
+          tools/debian_buildenv.sh setup
+          sudo apt-get install -y --no-install-recommends ninja-build
+
+      - name: "Restore ccache cache"
+        id: ccache_cache
+        uses: actions/cache/restore@v6
+        with:
+          path: /home/runner/.cache/ccache
+          key: ubuntu-24.04-djlib-${{ github.ref_name }}-${{ hashFiles('src/**', 'CMakeLists.txt', 'cmake/**') }}
+          restore-keys: |
+            ubuntu-24.04-djlib-${{ github.ref_name }}
+            ubuntu-24.04-djlib-
+
+      - name: "Set up ccache"
+        run: |
+          ccache --zero-stats
+          ccache --max-size=2G
+
+      - name: "Configure"
+        # Same options as the CT 206 dev build (research note §11).
+        run: >-
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DQT6=ON
+          -DQML=OFF
+          -DFFMPEG=ON
+          -DSTEM=ON
+          -DBULK=ON
+          -DMAD=ON
+          -DMODPLUG=ON
+          -DWAVPACK=ON
+          -DKEYFINDER=OFF
+          -DINSTALL_USER_UDEV_RULES=OFF
+          -DBUILD_TESTING=ON
+          -DDEBUG_ASSERTIONS_FATAL=OFF
+
+      - name: "Set up gcc problem matcher"
+        uses: ammaraskar/gcc-problem-matcher@0.3.0
+
+      - name: "Build"
+        run: cmake --build build --parallel "$(nproc)"
+
+      - name: "Print compiler cache stats"
+        run: ccache --show-stats
+
+      - name: "Save ccache cache"
+        if: steps.ccache_cache.outputs.cache-hit != 'true' && github.event_name == 'push' && github.ref_type == 'branch'
+        uses: actions/cache/save@v6
+        with:
+          path: /home/runner/.cache/ccache
+          key: ${{ steps.ccache_cache.outputs.cache-primary-key }}
+
+      - name: "Test"
+        run: ctest --timeout 45 -R "${CTEST_TESTS}"
+        working-directory: build
+        env:
+          GTEST_COLOR: 1
+          QT_QPA_PLATFORM: offscreen
+          CTEST_PARALLEL_LEVEL: 3
+          CTEST_OUTPUT_ON_FAILURE: 1
+
+  windows:
+    name: Windows 2022 x64 installer
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: windows-2022
+    permissions:
+      contents: write # to create the GitHub Release (tags only)
+    steps:
+      - name: "Check out repository"
+        uses: actions/checkout@v7
+        with:
+          # This is necessary for making `git describe` work.
+          fetch-depth: 0
+
+      - name: "Ensure that all tags are fetched"
+        # Works around an issue where not the latest tag is not fetched when the
+        # workflow is triggered by a tag push event.
+        # Possibly related: actions/checkout#290
+        run: git fetch origin --force --tags
+
+      - name: "Set up cmake"
+        uses: jwlawson/actions-setup-cmake@v2.2
+        with:
+          # This version of CMake is needed for Wix Toolset >= v4 support,
+          # see: https://cmake.org/cmake/help/latest/cpack_gen/wix.html#variable:CPACK_WIX_VERSION
+          cmake-version: "3.30.x"
+
+      - name: "Set up MSVC Developer Command Prompt"
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: "Get build environment name"
+        run: tools/windows_buildenv.bat name
+
+      - name: "Set up build environment"
+        # With the cmd shell the ERRORLEVEL is checked.
+        # Downloads the prebuilt vcpkg environment from downloads.mixxx.org.
+        shell: cmd
+        run: tools/windows_buildenv.bat setup
+        env:
+          BUILDENV_BASEPATH: C:\buildenv
+          BUILDENV_RELEASE: TRUE
+
+      - name: "Create build directory"
+        run: mkdir build
+
+      - name: "Configure"
+        # Upstream "Windows 2022 x64" cmake_args + the common upstream args,
+        # with FFMPEG/STEM forced on (the fork needs .stem.mp4 support, so fail
+        # loudly if the buildenv lacks FFmpeg) and WARNINGS_FATAL off.
+        run: >-
+          cmake
+          -DBULK=ON
+          -DHSS1394=ON
+          -DLOCALECOMPARE=ON
+          -DMAD=ON
+          -DMEDIAFOUNDATION=ON
+          -DMODPLUG=ON
+          -DQT6=ON
+          -DQML=ON
+          -DWAVPACK=ON
+          -DVCPKG_TARGET_TRIPLET=x64-windows-release
+          -DFFMPEG=ON
+          -DSTEM=ON
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_PREFIX_PATH="${{ env.CMAKE_PREFIX_PATH }}"
+          -DWARNINGS_FATAL=OFF
+          -DDEBUG_ASSERTIONS_FATAL=OFF
+          -DBATTERY=ON
+          -DBROADCAST=ON
+          -DDOWNLOAD_MANUAL=ON
+          -DHID=ON
+          -DKEYFINDER=ON
+          -DLILV=ON
+          -DOPUS=ON
+          -DQTKEYCHAIN=ON
+          -DVINYLCONTROL=ON
+          -DCMAKE_VERBOSE_MAKEFILE=OFF
+          -L
+          ..
+        working-directory: build
+        env:
+          CC: cl
+          CXX: cl
+
+      - name: "Set up MSVC problem matcher"
+        uses: ammaraskar/msvc-problem-matcher@0.3.0
+
+      - name: "Build"
+        # Ninja uses all cores by default
+        run: cmake --build . --config RelWithDebInfo
+        working-directory: build
+        env:
+          CC: cl
+          CXX: cl
+
+      - name: "Test"
+        run: ctest --timeout 45 -R "${env:CTEST_TESTS}"
+        working-directory: build
+        env:
+          GTEST_COLOR: 1
+          # Windows tests fail randomly if run in parallel
+          CTEST_PARALLEL_LEVEL: 1
+          CTEST_OUTPUT_ON_FAILURE: 1
+
+      - name: "Install WiX Toolset"
+        shell: pwsh
+        run: |
+          dotnet.exe tool install --global wix --version 6.0.2
+          wix extension add --global WixToolset.UI.wixext/6.0.2
+
+      - name: "Package"
+        id: package
+        run: cpack -G WIX -V
+        working-directory: build
+
+      - name: "Upload failed packaging logs"
+        if: always() && steps.package.outcome == 'failure'
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-2022-logs-packages-wix
+          path: ${{ github.workspace }}/build/_CPack_Packages/win64/WIX/wix.log
+
+      - name: "Upload installer artifact"
+        uses: actions/upload-artifact@v7
+        with:
+          name: Mixxx djlib Windows x64 Installer
+          path: build/*.msi
+          if-no-files-found: error
+
+      - name: "Create GitHub Release"
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/*.msi
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

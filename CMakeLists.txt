@@ -2133,7 +2133,8 @@ target_include_directories(
 )
 if(UNIX AND NOT APPLE)
   target_sources(mixxx-lib PRIVATE src/util/rlimit.cpp)
-  set(MIXXX_SETTINGS_PATH ".mixxx/")
+  # djlib fork: own settings dir, side by side with stock Mixxx (~/.mixxx/)
+  set(MIXXX_SETTINGS_PATH ".mixxx-djlib/")
 endif()
 
 if(APPLE)
@@ -2879,6 +2880,7 @@ if(BUILD_TESTING)
     src/test/dbconnectionpool_test.cpp
     src/test/dbidtest.cpp
     src/test/directorydaotest.cpp
+    src/test/djlibsettingspathtest.cpp
     src/test/duration_test.cpp
     src/test/durationutiltest.cpp
     #TODO: write useful tests for refactored effects system
@@ -5284,7 +5286,8 @@ configure_file(
 )
 
 # Packaging
-set(CPACK_PACKAGE_NAME "Mixxx")
+# djlib fork: own product identity so it installs side by side with stock Mixxx
+set(CPACK_PACKAGE_NAME "Mixxx djlib")
 set(CPACK_PACKAGE_VENDOR "Mixxx Project")
 # TODO: Split this into Maintainer field: core-team@mixxx.org for package issues
 # and Uploaders field for personal signing email per Debian Policy.
@@ -5295,8 +5298,8 @@ set(
   CPACK_PACKAGE_DESCRIPTION_FILE
   "${CMAKE_CURRENT_SOURCE_DIR}/packaging/CPackPackageDescription.txt"
 )
-set(CPACK_PACKAGE_INSTALL_DIRECTORY "Mixxx")
-set(CPACK_PACKAGE_EXECUTABLES "mixxx;Mixxx")
+set(CPACK_PACKAGE_INSTALL_DIRECTORY "Mixxx djlib")
+set(CPACK_PACKAGE_EXECUTABLES "mixxx;Mixxx djlib")
 set(CPACK_PACKAGE_ICON "${CMAKE_SOURCE_DIR}/res/images/mixxx_install_logo.bmp")
 set(CPACK_PACKAGE_HOMEPAGE_URL "https://www.mixxx.org/")
 set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
@@ -5411,7 +5414,9 @@ set(
 
 # Use WiX toolset version >= 4.0 for building Windows installers.
 set(CPACK_WIX_VERSION 4)
-set(CPACK_WIX_UPGRADE_GUID "921DC99C-4DCF-478D-B950-50685CB9E6BE")
+# djlib fork: new UpgradeCode. Must never be stock Mixxx's
+# (921DC99C-4DCF-478D-B950-50685CB9E6BE), else the MSI would upgrade/remove it.
+set(CPACK_WIX_UPGRADE_GUID "586EA3F0-5E73-404A-A4BE-C248FAAF8AC0")
 set(
   CPACK_WIX_LICENSE_RTF
   "${CMAKE_CURRENT_BINARY_DIR}/packaging/wix/LICENSE.rtf"
@@ -5449,23 +5454,13 @@ if(WIN32)
     )
   endif()
 
-  # Build the custom action DLL for cross-scope upgrade detection.
-  # Old Mixxx (<=2.5) was installed per-user due to a CPack bug (CMP0172).
-  # The standard FindRelatedProducts skips per-user products when the
-  # current install is per-machine.  The custom action calls scope-agnostic
-  # MsiEnumRelatedProducts() to detect and mark the old installation for
-  # removal by RemoveExistingProducts.
-  add_subdirectory(packaging/wix)
+  # djlib fork: the upstream cross-scope upgrade custom action
+  # (packaging/wix, MixxxUpgradePatch.xml) is not built or patched in. It only
+  # exists to remove per-user Mixxx <= 2.5 installs, which the fork never had,
+  # and it hard-codes stock Mixxx's UpgradeCode, i.e. it would remove stock
+  # Mixxx. Upgrades between fork versions use the standard
+  # FindRelatedProducts/RemoveExistingProducts on CPACK_WIX_UPGRADE_GUID.
   set(CPACK_WIX_INSTALL_SCOPE "perMachine")
-  file(
-    GENERATE OUTPUT
-      "${CMAKE_CURRENT_BINARY_DIR}/packaging/wix/MixxxUpgradePatch.xml"
-    INPUT "${CMAKE_CURRENT_SOURCE_DIR}/packaging/wix/MixxxUpgradePatch.xml.in"
-  )
-  set(
-    CPACK_WIX_PATCH_FILE
-    "${CMAKE_CURRENT_BINARY_DIR}/packaging/wix/MixxxUpgradePatch.xml"
-  )
 
   # uses CMAKE_PROJECT_VERSION
   configure_file(packaging/wix/LICENSE.rtf.in packaging/wix/LICENSE.rtf @ONLY)
