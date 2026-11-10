@@ -216,6 +216,22 @@ DirectoryDAO::RelocateResult TrackCollection::relocateDirectory(
     return result;
 }
 
+std::optional<RelocatedTrack> TrackCollection::relocateTrack(
+        TrackId trackId, const mixxx::FileInfo& newFileInfo) {
+    DEBUG_ASSERT_QOBJECT_THREAD_AFFINITY(this);
+
+    SqlTransaction transaction(m_database);
+    auto relocatedTrack = m_trackDao.relocateTrack(trackId, newFileInfo);
+    if (!relocatedTrack) {
+        return std::nullopt;
+    }
+    transaction.commit();
+    // Same path as relocateDirectory().
+    m_trackDao.slotDatabaseTracksRelocated({*relocatedTrack});
+    GlobalTrackCacheLocker().relocateCachedTracks(&m_trackDao);
+    return relocatedTrack;
+}
+
 QList<TrackId> TrackCollection::resolveTrackIds(
         const QList<QUrl>& urls,
         TrackDAO::ResolveTrackIdFlags flags) {

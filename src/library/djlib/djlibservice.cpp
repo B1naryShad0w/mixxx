@@ -36,6 +36,8 @@ const QString kSidecarSuffix = QStringLiteral(".djlib.json");
 
 DjlibService* s_pInstance = nullptr;
 
+std::function<bool(const QString&)> s_readFailureForTesting;
+
 bool isPackageName(const QString& name) {
     return name.endsWith(kPackageSuffix, Qt::CaseInsensitive);
 }
@@ -64,6 +66,9 @@ FileStamp stampOf(const QFileInfo& info) {
 
 /// Reads a whole small file; the handle is closed before returning.
 std::optional<QByteArray> readFile(const QString& path) {
+    if (s_readFailureForTesting && s_readFailureForTesting(path)) {
+        return std::nullopt;
+    }
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly)) {
         return std::nullopt;
@@ -71,22 +76,34 @@ std::optional<QByteArray> readFile(const QString& path) {
     return file.readAll();
 }
 
-std::optional<DjlibSidecar> readSidecar(const QString& path, QByteArray* pJson) {
+enum class ReadResult {
+    Ok,
+    ReadFailed, // transient (sharing violation, ...): retry
+    Invalid,    // retried only when the file changes
+};
+
+ReadResult readSidecar(const QString& path, DjlibSidecar* pSidecar, QByteArray* pJson) {
     const auto json = readFile(path);
     if (!json) {
-        kLogger.warning() << "Cannot read" << path;
-        return std::nullopt;
+        kLogger.warning() << "Cannot read" << path << "- retrying later";
+        return ReadResult::ReadFailed;
     }
     QString error;
     auto sidecar = DjlibSidecar::parse(*json, &error);
     if (!sidecar) {
         kLogger.warning() << "Invalid sidecar" << path << error;
-        return std::nullopt;
+        return ReadResult::Invalid;
     }
+    *pSidecar = std::move(*sidecar);
     if (pJson) {
         *pJson = *json;
     }
-    return sidecar;
+    return ReadResult::Ok;
+}
+
+bool isUsableDir(const QString& path) {
+    const QFileInfo info(path);
+    return info.isDir() && info.isReadable();
 }
 
 QHash<QString, FileStamp> listTracksDir(const QString& tracksDir) {
@@ -100,25 +117,40 @@ QHash<QString, FileStamp> listTracksDir(const QString& tracksDir) {
     return result;
 }
 
+SidecarCrates cratesOf(const DjlibSidecar& sidecar) {
+    SidecarCrates entry{sidecar.trackId, {}};
+    for (const auto& crate : sidecar.crates) {
+        entry.crateIds.append(crate.id);
+    }
+    return entry;
+}
+
 /// The crates of every sidecar whose package is present (all of them, or only
-/// those listing one of `onlyCrateIds`).
+/// those listing one of `onlyCrateIds`). `known`: sidecars already parsed.
 QList<SidecarCrates> collectMemberships(const QString& tracksDir,
         const QHash<QString, FileStamp>& snapshot,
-        const QSet<QString>& onlyCrateIds) {
+        const QSet<QString>& onlyCrateIds,
+        const QHash<QString, SidecarCrates>& known) {
     QList<SidecarCrates> result;
     for (auto it = snapshot.constBegin(); it != snapshot.constEnd(); ++it) {
         if (!isSidecarName(it.key()) || !snapshot.contains(packageNameOf(it.key()))) {
             continue;
         }
-        const auto sidecar = readSidecar(QDir(tracksDir).filePath(it.key()), nullptr);
-        if (!sidecar) {
-            continue;
+        SidecarCrates entry;
+        const auto knownIt = known.constFind(it.key());
+        if (knownIt != known.constEnd()) {
+            entry = *knownIt;
+        } else {
+            DjlibSidecar sidecar;
+            if (readSidecar(QDir(tracksDir).filePath(it.key()), &sidecar, nullptr) !=
+                    ReadResult::Ok) {
+                continue;
+            }
+            entry = cratesOf(sidecar);
         }
-        SidecarCrates entry{sidecar->trackId, {}};
         bool relevant = onlyCrateIds.isEmpty();
-        for (const auto& crate : sidecar->crates) {
-            entry.crateIds.append(crate.id);
-            relevant |= onlyCrateIds.contains(crate.id);
+        for (const auto& id : std::as_const(entry.crateIds)) {
+            relevant |= onlyCrateIds.contains(id);
         }
         if (relevant) {
             result.append(entry);
@@ -136,39 +168,46 @@ PassResult runPass(quint64 generation,
         const std::optional<FileStamp>& cratesStamp) {
     PassResult result;
     result.generation = generation;
-    result.snapshot = listTracksDir(tracksDir);
+    result.tracksDirOk = isUsableDir(tracksDir);
+    // A missing/unreadable dir (unplugged drive, dropped share) is not
+    // "every package removed": keep the old snapshot.
+    result.snapshot = result.tracksDirOk ? listTracksDir(tracksDir) : snapshot;
 
+    result.cratesStamp = cratesStamp;
     const QFileInfo cratesInfo(cratesPath);
     if (cratesInfo.exists()) {
-        result.cratesStamp = stampOf(cratesInfo);
+        const FileStamp stamp = stampOf(cratesInfo);
+        if (stamp != cratesStamp) {
+            const auto json = readFile(cratesPath);
+            if (!json) {
+                // Not adopting the stamp: retried on the next pass.
+                kLogger.warning() << "Cannot read" << cratesPath << "- retrying later";
+                result.readFailures.append(cratesPath);
+            } else {
+                result.cratesStamp = stamp;
+                QString error;
+                result.crates = djlib::parseCratesJson(*json, &error);
+                if (!result.crates) {
+                    // Never reconcile on an invalid file: that would delete
+                    // every managed crate. Retried when the file changes.
+                    kLogger.warning() << "Invalid" << cratesPath << error;
+                }
+            }
+        }
     }
-    if (result.cratesStamp && result.cratesStamp != cratesStamp) {
-        result.cratesChanged = true;
-        const auto json = readFile(cratesPath);
-        QString error;
-        if (json) {
-            result.crates = djlib::parseCratesJson(*json, &error);
-        }
-        if (!result.crates) {
-            // Never reconcile on a read/parse failure: that would delete
-            // every managed crate. Retried when the file changes again.
-            kLogger.warning() << "Invalid" << cratesPath << error;
-        }
+    if (!result.tracksDirOk) {
+        return result;
     }
 
-    for (auto it = snapshot.constBegin(); it != snapshot.constEnd(); ++it) {
-        if (isPackageName(it.key()) && !result.snapshot.contains(it.key())) {
-            result.removedPackages.append(it.key());
-        }
-    }
     QSet<QString> sidecarsToRead;
+    QStringList changedPackages;
     for (auto it = result.snapshot.constBegin(); it != result.snapshot.constEnd(); ++it) {
         const auto previous = snapshot.constFind(it.key());
         if (previous != snapshot.constEnd() && *previous == it.value()) {
             continue;
         }
         if (isPackageName(it.key())) {
-            result.addedPackages.append(it.key());
+            changedPackages.append(it.key());
             // A sidecar that may have waited for this package.
             const QString sidecarName = sidecarNameOf(it.key());
             if (result.snapshot.contains(sidecarName)) {
@@ -178,20 +217,37 @@ PassResult runPass(quint64 generation,
             sidecarsToRead.insert(it.key());
         }
     }
-    result.addedPackages.sort();
     QStringList sidecarNames(sidecarsToRead.cbegin(), sidecarsToRead.cend());
     sidecarNames.sort();
+    QSet<QString> handledPackages; // a sidecar item imports them
+    QHash<QString, SidecarCrates> known;
     for (const auto& name : std::as_const(sidecarNames)) {
         ParsedSidecar parsed;
         parsed.sidecarName = name;
-        auto sidecar = readSidecar(QDir(tracksDir).filePath(name), &parsed.json);
-        if (sidecar) {
-            parsed.sidecar = std::move(*sidecar);
+        switch (readSidecar(QDir(tracksDir).filePath(name), &parsed.sidecar, &parsed.json)) {
+        case ReadResult::Ok:
+            handledPackages.insert(packageNameOf(name));
+            known.insert(name, cratesOf(parsed.sidecar));
             result.sidecars.append(std::move(parsed));
+            break;
+        case ReadResult::ReadFailed:
+            // Not in the snapshot: it shows up as new on the next pass.
+            result.snapshot.remove(name);
+            result.readFailures.append(name);
+            handledPackages.insert(packageNameOf(name));
+            break;
+        case ReadResult::Invalid:
+            break;
+        }
+    }
+    changedPackages.sort();
+    for (const auto& name : std::as_const(changedPackages)) {
+        if (!handledPackages.contains(name)) {
+            result.addedPackages.append(name);
         }
     }
     if (result.crates) {
-        result.memberships = collectMemberships(tracksDir, result.snapshot, {});
+        result.memberships = collectMemberships(tracksDir, result.snapshot, {}, known);
     }
     return result;
 }
@@ -212,8 +268,12 @@ DjlibService::DjlibService(UserSettingsPointer pConfig,
     if (!m_store.initialize()) {
         kLogger.warning() << "Cannot create the djlib tables";
     }
-    // Workers: one pass/membership job plus one sample-rate probe at a time.
-    m_pool.setMaxThreadCount(2);
+    // One pass/membership job at a time; probes have their own pool so 200
+    // new packages never delay the next pass.
+    m_pool.setMaxThreadCount(1);
+    m_probePool.setMaxThreadCount(1);
+    m_retryTimer.setSingleShot(true);
+    connect(&m_retryTimer, &QTimer::timeout, this, &DjlibService::requestPass);
 
     m_debounceTimer.setSingleShot(true);
     connect(&m_debounceTimer, &QTimer::timeout, this, &DjlibService::startPass);
@@ -271,6 +331,11 @@ DjlibService::~DjlibService() {
     }
     m_generation++;
     m_pool.waitForDone();
+    m_probePool.waitForDone();
+}
+
+void djlib::setReadFailureForTesting(std::function<bool(const QString& path)> fn) {
+    s_readFailureForTesting = std::move(fn);
 }
 
 // static
@@ -311,6 +376,9 @@ void DjlibService::rearm() {
     m_debounceTimer.stop();
     m_safetyTimer.stop();
     m_queueTimer.stop();
+    m_retryTimer.stop();
+    m_retryDelayMillis = 0;
+    m_tracksDirMissing = false;
     m_burst.invalidate();
     if (!m_watcher.directories().isEmpty()) {
         m_watcher.removePaths(m_watcher.directories());
@@ -401,17 +469,25 @@ void DjlibService::startPass() {
 void DjlibService::onPassFinished(PassResult result) {
     m_passRunning = false;
     if (result.generation == m_generation) {
-        m_snapshot = std::move(result.snapshot);
-        if (result.cratesChanged) {
-            // An invalid file is retried only once it changes again.
-            m_cratesStamp = result.cratesStamp;
+        if (result.tracksDirOk == m_tracksDirMissing) {
+            m_tracksDirMissing = !result.tracksDirOk;
+            if (m_tracksDirMissing) {
+                kLogger.warning() << tracksDir()
+                                  << "is missing or unreadable - keeping the djlib "
+                                     "crates as they are until it is back";
+            } else {
+                kLogger.info() << tracksDir() << "is available";
+            }
         }
+        m_snapshot = std::move(result.snapshot);
+        m_cratesStamp = result.cratesStamp;
         // crates.json first: memberships need the managed crates.
         if (result.crates) {
             enqueue(Item{Item::Kind::Reconcile, {}, {}, *result.crates, {}, true});
         }
-        for (const auto& name : std::as_const(result.removedPackages)) {
-            enqueue(Item{Item::Kind::PackageRemoved, name, {}, {}, {}, false});
+        // Packages gone, also while Mixxx was closed (persisted rows vs listing).
+        if (result.tracksDirOk) {
+            enqueue(Item{Item::Kind::Sweep, {}, {}, {}, {}, false});
         }
         for (const auto& name : std::as_const(result.addedPackages)) {
             enqueue(Item{Item::Kind::PackageAdded, name, {}, {}, {}, false});
@@ -428,6 +504,15 @@ void DjlibService::onPassFinished(PassResult result) {
                     membership.crateIds,
                     false});
         }
+        // Read failures (sharing violation, AV scanner, ...): retry with backoff.
+        if (result.readFailures.isEmpty()) {
+            m_retryDelayMillis = 0;
+        } else {
+            m_retryDelayMillis = m_retryDelayMillis == 0
+                    ? m_timing.retryMinMillis
+                    : std::min(2 * m_retryDelayMillis, m_timing.retryMaxMillis);
+            m_retryTimer.start(m_retryDelayMillis);
+        }
     }
     if (m_passRequested) {
         m_passRequested = false;
@@ -443,7 +528,12 @@ void DjlibService::startMembershipJob(const QSet<QString>& crateIds) {
     }
     ++m_jobsRunning;
     const quint64 generation = m_generation;
-    QtConcurrent::run(&m_pool, collectMemberships, tracksDir(), m_snapshot, crateIds)
+    QtConcurrent::run(&m_pool,
+            collectMemberships,
+            tracksDir(),
+            m_snapshot,
+            crateIds,
+            QHash<QString, SidecarCrates>())
             .then(this, [this, generation](QList<SidecarCrates> memberships) {
                 --m_jobsRunning;
                 if (generation == m_generation) {
@@ -469,7 +559,7 @@ void DjlibService::startProbe(const TrackPointer& pTrack) {
     ++m_jobsRunning;
     // Opens the audio source once to read the stream info (sample rate), as
     // AnalyzerThread does. The source is closed again right away.
-    QtConcurrent::run(&m_pool,
+    QtConcurrent::run(&m_probePool,
             [pTrack] {
                 SoundSourceProxy(pTrack).openAudioSource();
             })
@@ -487,7 +577,8 @@ void DjlibService::startProbe(const TrackPointer& pTrack) {
 }
 
 void DjlibService::scheduleReconcile() {
-    if (m_reconcileQueued || !m_crates) {
+    // Our own deletes during reconcile() emit crateDeleted too: ignore them.
+    if (m_reconcileQueued || m_reconciling || !m_crates) {
         return;
     }
     m_reconcileQueued = true;
@@ -525,8 +616,8 @@ void DjlibService::process(const Item& item) {
     case Item::Kind::Reconcile:
         reconcile(item.crates, item.membershipsIncluded);
         break;
-    case Item::Kind::PackageRemoved:
-        packageRemoved(item.name);
+    case Item::Kind::Sweep:
+        sweepMissingPackages();
         break;
     case Item::Kind::PackageAdded:
         packageAdded(item.name);
@@ -547,9 +638,11 @@ void DjlibService::reconcile(const QList<djlib::CrateRef>& crates, bool membersh
     m_reconcileQueued = false;
     m_crates = crates;
     QStringList createdIds;
+    m_reconciling = true;
     if (!m_crateSync.reconcile(crates, &createdIds)) {
         kLogger.warning() << "crates.json reconcile had errors";
     }
+    m_reconciling = false;
     // Recreated crates start empty. After a crates.json change the membership
     // of all tracks is re-applied anyway (queued behind this item).
     if (!membershipsIncluded && !createdIds.isEmpty()) {
@@ -569,23 +662,22 @@ bool DjlibService::isTrackLoaded(const TrackPointer& pTrack) const {
     return m_trackLoadedFn && m_trackLoadedFn(pTrack);
 }
 
-void DjlibService::packageRemoved(const QString& packageName) {
-    if (m_snapshot.contains(packageName)) {
-        return; // back again meanwhile
-    }
-    // The track stays in the library (playlists, history) for Mixxx's
-    // missing-track handling; only the djlib crates change.
+void DjlibService::sweepMissingPackages() {
+    // Compares the persisted rows with the current listing, so removals made
+    // while Mixxx was closed are caught too. Only called with a usable
+    // tracks/ dir. The track stays in the library (playlists, history) for
+    // Mixxx's missing-track handling; only the djlib crates change.
     for (auto state : m_store.trackStates()) {
-        if (state.file != packageName) {
+        if (!state.trackId.isValid() || state.sidecarVersion < 0 ||
+                m_snapshot.contains(state.file)) {
             continue;
         }
-        if (state.trackId.isValid()) {
-            m_crateSync.setMembership(state.trackId, {});
-        }
+        kLogger.info() << state.file << "is gone: leaving the djlib crates";
+        m_crateSync.setMembership(state.trackId, {});
         m_deferred.remove(state.djlibId);
-        // If the package comes back, its sidecar is applied again (the
-        // fingerprints stay, so DJ edits still win).
-        state.sidecarVersion = 0;
+        // -1 = package gone: if it comes back (or under a new name), its
+        // sidecar is applied again; the fingerprints stay, so DJ edits win.
+        state.sidecarVersion = -1;
         m_store.upsertTrackState(state);
     }
 }
@@ -627,13 +719,21 @@ void DjlibService::sidecarChanged(const ParsedSidecar& parsed) {
         }
         return;
     }
-    // Fast path (startup pass): nothing newer to apply, no library access.
+    const QString path = QDir(tracksDir()).filePath(packageName);
+    // Fast path (startup pass): nothing newer to apply and the mapped library
+    // track still is this file (not moved), so no track needs loading.
     if (existing && existing->trackId.isValid() && !existing->pendingJson &&
             !m_deferred.contains(sidecar.trackId) &&
-            sidecar.sidecarVersion <= existing->sidecarVersion) {
+            sidecar.sidecarVersion <= existing->sidecarVersion &&
+            m_pTrackCollectionManager->internalCollection()
+                            ->getTrackDAO()
+                            .getTrackLocation(existing->trackId) ==
+                    mixxx::FileInfo(path).location()) {
         return;
     }
-    const QString path = QDir(tracksDir()).filePath(packageName);
+    if (existing && existing->trackId.isValid()) {
+        relocateIfMoved(existing->trackId, path);
+    }
     const TrackPointer pTrack =
             m_pTrackCollectionManager->getOrAddTrack(TrackRef::fromFilePath(path));
     if (!pTrack) {
@@ -641,11 +741,12 @@ void DjlibService::sidecarChanged(const ParsedSidecar& parsed) {
         return;
     }
     if (existing && existing->trackId.isValid() && existing->trackId != pTrack->getId()) {
-        // The djlib track is another library track now (file renamed while
-        // Mixxx was closed; no TrackDAO relocation, see header): start fresh.
-        // The old fingerprints describe the old track and would read as DJ
-        // edits here.
+        // Couldn't relocate (old file still there, or the new file already
+        // was a library track): the new library track takes over. The old one
+        // leaves the djlib crates; the old fingerprints describe the old
+        // track and would read as DJ edits here, so start fresh.
         kLogger.info() << sidecar.trackId << "moved to" << path << "(new library track)";
+        m_crateSync.setMembership(existing->trackId, {});
         DjlibStore::TrackState state = *existing;
         state.trackId = TrackId();
         state.sidecarVersion = 0;
@@ -655,6 +756,25 @@ void DjlibService::sidecarChanged(const ParsedSidecar& parsed) {
         m_store.upsertTrackState(state);
     }
     applyToTrack(pTrack, sidecar);
+}
+
+void DjlibService::relocateIfMoved(TrackId trackId, const QString& newPath) {
+    const mixxx::FileInfo newFileInfo(newPath);
+    const QString oldLocation =
+            m_pTrackCollectionManager->internalCollection()->getTrackDAO().getTrackLocation(
+                    trackId);
+    if (oldLocation.isEmpty() || oldLocation == newFileInfo.location() ||
+            QFileInfo::exists(oldLocation)) {
+        return; // not in the library, not moved, or a copy
+    }
+    if (m_pTrackCollectionManager->getTrackByRef(TrackRef::fromFileInfo(newFileInfo))) {
+        return; // the new file already is a library track
+    }
+    // Renamed by the agent (title fix) or library folder moved: keep the
+    // row with all DJ edits, cues and history.
+    if (!m_pTrackCollectionManager->relocateTrack(trackId, newFileInfo)) {
+        kLogger.warning() << "Cannot relocate" << oldLocation << "->" << newPath;
+    }
 }
 
 void DjlibService::applyMembership(const QString& djlibId, const QStringList& crateIds) {

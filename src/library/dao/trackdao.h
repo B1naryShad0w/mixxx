@@ -8,6 +8,7 @@
 #include <QString>
 #include <QtSql/QSqlQuery>
 #include <memory>
+#include <optional>
 
 #include "library/dao/dao.h"
 #include "library/relocatedtrack.h"
@@ -80,6 +81,13 @@ class TrackDAO : public QObject, public virtual DAO, public virtual GlobalTrackC
 
     // Only used by friend class TrackCollection, but public for testing!
     bool saveTrack(Track* pTrack) const;
+
+    // djlib fork: points the existing row of `trackId` at `newLocation` (a file
+    // that isn't in the library yet), keeping all its metadata, cues and
+    // history. Modelled on detectMovedTracks/relocateDirectory. Doesn't start
+    // a transaction. Returns std::nullopt if not possible.
+    std::optional<RelocatedTrack> relocateTrack(
+            TrackId trackId, const mixxx::FileInfo& newFileInfo) const;
 
     /// Update the play counter properties according to the corresponding
     /// aggregated properties obtained from the played history.

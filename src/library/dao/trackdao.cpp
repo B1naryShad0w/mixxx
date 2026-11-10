@@ -2556,3 +2556,54 @@ QString TrackDAO::findLastTimeAddedToHistory(TrackId trackId) const {
 
     return QString();
 }
+
+std::optional<RelocatedTrack> TrackDAO::relocateTrack(
+        TrackId trackId, const mixxx::FileInfo& newFileInfo) const {
+    const QString newLocation = newFileInfo.location();
+    QSqlQuery query(m_database);
+    query.prepare(QStringLiteral(
+            "SELECT track_locations.id, track_locations.location "
+            "FROM library INNER JOIN track_locations ON library.location=track_locations.id "
+            "WHERE library.id=:id"));
+    query.bindValue(":id", trackId.toVariant());
+    if (!query.exec()) {
+        LOG_FAILED_QUERY(query);
+        return std::nullopt;
+    }
+    if (!query.next()) {
+        return std::nullopt;
+    }
+    const DbId locationId(query.value(0));
+    const QString oldLocation = query.value(1).toString();
+    if (oldLocation == newLocation) {
+        return std::nullopt;
+    }
+    // track_locations.location is UNIQUE: a row for the new location (an
+    // orphan or another track) blocks the move.
+    query.prepare(QStringLiteral("SELECT id FROM track_locations WHERE location=:location"));
+    query.bindValue(":location", newLocation);
+    if (!query.exec()) {
+        LOG_FAILED_QUERY(query);
+        return std::nullopt;
+    }
+    if (query.next()) {
+        return std::nullopt;
+    }
+    query.prepare(QStringLiteral(
+            "UPDATE track_locations SET location=:location, filename=:filename, "
+            "directory=:directory, filesize=:filesize, fs_deleted=0, "
+            "needs_verification=0 WHERE id=:id"));
+    query.bindValue(":location", newLocation);
+    query.bindValue(":filename", newFileInfo.asQFileInfo().fileName());
+    query.bindValue(":directory", newFileInfo.locationPath());
+    query.bindValue(":filesize", newFileInfo.sizeInBytes());
+    query.bindValue(":id", locationId.toVariant());
+    if (!query.exec()) {
+        LOG_FAILED_QUERY(query);
+        return std::nullopt;
+    }
+    kLogger.info() << "Relocated track" << trackId << oldLocation << "->" << newLocation;
+    return RelocatedTrack(
+            TrackRef::fromFilePath(oldLocation, trackId),
+            TrackRef::fromFileInfo(newFileInfo));
+}

@@ -166,6 +166,9 @@ class TrackCollection : public QObject,
     DirectoryDAO::AddResult addDirectory(const mixxx::FileInfo& rootDir);
     DirectoryDAO::RemoveResult removeDirectory(const mixxx::FileInfo& rootDir);
     DirectoryDAO::RelocateResult relocateDirectory(const QString& oldDir, const QString& newDir);
+    // djlib fork: see TrackDAO::relocateTrack.
+    std::optional<RelocatedTrack> relocateTrack(
+            TrackId trackId, const mixxx::FileInfo& newFileInfo);
 
     bool saveTrack(Track* pTrack) const;
 

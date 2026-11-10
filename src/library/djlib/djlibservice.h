@@ -43,7 +43,13 @@ struct ServiceTiming {
     int debounceMillis = 1500;
     int maxDelayMillis = 10000; // force a pass after this much continuous activity
     int safetyPassMillis = 60000;
+    int retryMinMillis = 1000; // after a read failure; doubles up to retryMaxMillis
+    int retryMaxMillis = 60000;
 };
+
+/// Tests only: makes reading `path` fail (as a sharing violation would)
+/// while `fn(path)` returns true. Called on worker threads.
+void setReadFailureForTesting(std::function<bool(const QString& path)> fn);
 
 /// A sidecar read and parsed on a worker thread.
 struct ParsedSidecar {
@@ -61,14 +67,16 @@ struct SidecarCrates {
 /// Result of one directory pass, computed on a worker thread.
 struct PassResult {
     quint64 generation = 0;
+    // false: tracks/ missing or unreadable; `snapshot` is the old one then
+    // and nothing counts as removed.
+    bool tracksDirOk = false;
     QHash<QString, FileStamp> snapshot; // name -> stamp, filtered names only
     std::optional<FileStamp> cratesStamp;
-    bool cratesChanged = false;
     std::optional<QList<CrateRef>> crates; // set iff changed and valid
-    QStringList removedPackages;
-    QStringList addedPackages; // new or changed
+    QStringList addedPackages; // new or changed, without a sidecar
     QList<ParsedSidecar> sidecars;
     QList<SidecarCrates> memberships; // all sidecars with a package, iff crates changed
+    QStringList readFailures;         // not in the snapshot/stamp: retried
 };
 
 } // namespace djlib
@@ -91,16 +99,22 @@ struct PassResult {
 ///   membership of all mapped tracks is re-applied from the sidecars on disk.
 /// - Sidecar without package: kept as `pending_json` until the package shows
 ///   up. Package without sidecar: imported so it shows in the library; it waits
-///   for its sidecar. Package removed: dropped from the managed crates, the
-///   track stays in the library.
+///   for its sidecar. Package gone (also while Mixxx was closed: every pass
+///   compares the `djlib_tracks` rows with the listing): dropped from the
+///   managed crates, the track stays in the library. A missing/unreadable
+///   tracks/ dir is not "everything removed": the old snapshot is kept.
+/// - A file that can't be read (not: invalid) isn't recorded and is retried
+///   with a backoff (1 s doubling to 60 s).
 /// - Beats/cues/key of a track loaded in a deck are deferred until the deck
 ///   unloads it (`slotDeckTrackChanged`); an unknown sample rate is probed on a
 ///   worker (`SoundSourceProxy::openAudioSource`) and the import completed.
 /// - `<lib>/tracks` is registered once as a library root directory.
-/// - Renamed files (same djlib track id, new file): `TrackDAO` relocation is not
-///   done (core diff); the new file becomes a new library track and the djlib
-///   state starts fresh on it (fingerprints of the old row would otherwise
-///   read as DJ edits). DJ edits on the old row stay with that (missing) row.
+/// - Renamed/moved files (same djlib track id, new file or library folder): if
+///   the mapped library track's file is gone and the new file isn't in the
+///   library yet, the row is relocated (`TrackCollectionManager::relocateTrack`)
+///   so cues, edits and history stay. Otherwise the new file is a new library
+///   track: the old one leaves the managed crates and the djlib state starts
+///   fresh (old fingerprints would read as DJ edits).
 ///
 /// Settings: `[djlib] LibraryPath` (empty = disabled). Main thread only.
 class DjlibService : public QObject {
@@ -170,7 +184,7 @@ class DjlibService : public QObject {
     struct Item {
         enum class Kind {
             Reconcile,
-            PackageRemoved,
+            Sweep,
             PackageAdded,
             Sidecar,
             Membership,
@@ -202,7 +216,8 @@ class DjlibService : public QObject {
     void processNext();
     void process(const Item& item);
     void reconcile(const QList<djlib::CrateRef>& crates, bool membershipsIncluded);
-    void packageRemoved(const QString& packageName);
+    void sweepMissingPackages();
+    void relocateIfMoved(TrackId trackId, const QString& newPath);
     void packageAdded(const QString& packageName);
     void sidecarChanged(const djlib::ParsedSidecar& parsed);
     void applyMembership(const QString& djlibId, const QStringList& crateIds);
@@ -233,13 +248,18 @@ class DjlibService : public QObject {
     QTimer m_debounceTimer;
     QTimer m_safetyTimer;
     QTimer m_queueTimer;
+    QTimer m_retryTimer;
     QElapsedTimer m_burst;
-    QThreadPool m_pool;
+    QThreadPool m_pool;      // passes and membership jobs
+    QThreadPool m_probePool; // sample-rate probes (never delay a pass)
 
     bool m_passRunning = false;
     bool m_passRequested = false;
     int m_jobsRunning = 0;
     bool m_reconcileQueued = false;
+    bool m_reconciling = false;
+    bool m_tracksDirMissing = false;
+    int m_retryDelayMillis = 0;
 
     QHash<QString, djlib::FileStamp> m_snapshot;
     std::optional<djlib::FileStamp> m_cratesStamp;

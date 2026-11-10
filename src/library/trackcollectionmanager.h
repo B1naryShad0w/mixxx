@@ -81,6 +81,9 @@ class TrackCollectionManager: public QObject,
     DirectoryDAO::RemoveResult removeDirectory(const mixxx::FileInfo& oldDir) const;
     DirectoryDAO::RelocateResult relocateDirectory(
             const QString& oldDir, const QString& newDir) const;
+    // djlib fork: moves the library row of `trackId` to a file that isn't in
+    // the library yet (renamed/moved file), keeping all its data.
+    bool relocateTrack(TrackId trackId, const mixxx::FileInfo& newFileInfo) const;
 
     TrackPointer getOrAddTrack(
             const TrackRef& trackRef,

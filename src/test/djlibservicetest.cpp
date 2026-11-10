@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 
 #include <QDir>
+#include <atomic>
+#include <memory>
 #include <iostream>
 #include <QElapsedTimer>
 #include <QFile>
@@ -23,6 +25,7 @@
 #include "preferences/keydetectionsettings.h"
 #include "test/librarytest.h"
 #include "track/beats.h"
+#include "track/cue.h"
 #include "track/track.h"
 
 namespace {
@@ -115,27 +118,46 @@ class DjlibServiceTest : public LibraryTest {
 
     ~DjlibServiceTest() override {
         m_pService.reset();
+        djlib::setReadFailureForTesting(nullptr);
     }
 
-    void startService() {
+    void createService() {
         DjlibService::Timing timing;
         timing.debounceMillis = 100;
         timing.maxDelayMillis = 500;
         timing.safetyPassMillis = 60000;
+        timing.retryMinMillis = 50;
+        timing.retryMaxMillis = 400;
         m_pService = std::make_unique<DjlibService>(
                 config(), trackCollectionManager(), nullptr, timing);
         m_pService->setTrackLoadedFn([this](const TrackPointer& pTrack) {
             return pTrack && m_loaded.contains(pTrack->getId());
         });
-        m_pService->setLibraryPath(m_libDir.path());
+    }
+
+    void startService() {
+        createService();
+        m_pService->setLibraryPath(m_libPath);
+    }
+
+    /// Like Mixxx: the path comes from the settings.
+    void startServiceFromConfig() {
+        config()->setValue(DjlibService::kLibraryPathKey, m_libPath);
+        createService();
+        m_pService->start();
+    }
+
+    /// Mixxx closed.
+    void stopService() {
+        m_pService.reset();
     }
 
     QString tracksPath(const QString& name) const {
-        return QDir(m_libDir.path()).filePath(QStringLiteral("tracks/") + name);
+        return QDir(m_libPath).filePath(QStringLiteral("tracks/") + name);
     }
 
     QString cratesPath() const {
-        return QDir(m_libDir.path()).filePath(QStringLiteral("_djlib/crates.json"));
+        return QDir(m_libPath).filePath(QStringLiteral("_djlib/crates.json"));
     }
 
     void writeCrates(const QStringList& ids) {
@@ -166,12 +188,13 @@ class DjlibServiceTest : public LibraryTest {
     }
 
     QStringList managedCrates(int i) {
-        QStringList result;
         const auto pTrack = track(i);
-        if (!pTrack) {
-            return result;
-        }
-        auto select = internalCollection()->crates().selectTrackCratesSorted(pTrack->getId());
+        return pTrack ? managedCratesOf(pTrack->getId()) : QStringList();
+    }
+
+    QStringList managedCratesOf(TrackId trackId) {
+        QStringList result;
+        auto select = internalCollection()->crates().selectTrackCratesSorted(trackId);
         while (select.next()) {
             const auto mapping = m_pService->store().crateMappingByCrateId(select.crateId());
             if (mapping) {
@@ -189,6 +212,7 @@ class DjlibServiceTest : public LibraryTest {
     }
 
     QTemporaryDir m_libDir;
+    QString m_libPath = m_libDir.path();
     QSet<TrackId> m_loaded;
     std::unique_ptr<DjlibService> m_pService;
 };
@@ -400,7 +424,8 @@ TEST_F(DjlibServiceTest, packageRemovedDropsCratesKeepsTrack) {
             QDir(m_libDir.path()).filePath(QStringLiteral("_removed/") + sidecarName(1))));
 
     ASSERT_TRUE(QTest::qWaitFor(
-            [this] { return managedCrates(1).isEmpty(); }, kTimeoutMillis));
+            [this, trackId] { return managedCratesOf(trackId).isEmpty(); },
+            kTimeoutMillis));
     EXPECT_TRUE(trackCollectionManager()->getTrackById(trackId));
     EXPECT_TRUE(m_pService->store().crateMapping("crate_a"));
 }
@@ -494,4 +519,183 @@ TEST_F(DjlibServiceTest, preferencesPageSetsPathAndWarns) {
     page.slotResetToDefaults();
     page.slotApply();
     EXPECT_EQ(QString(), m_pService->libraryPath());
+}
+
+namespace {
+
+void addDjHotCue(const TrackPointer& pTrack) {
+    pTrack->createAndAddCue(mixxx::CueType::HotCue,
+            1, // hot cue 2
+            mixxx::audio::FramePos(1000),
+            mixxx::audio::kInvalidFramePos);
+}
+
+bool hasDjHotCue(const TrackPointer& pTrack) {
+    const CuePointer pCue = pTrack ? pTrack->findHotcueByIndex(1) : CuePointer();
+    return pCue && pCue->getPosition() == mixxx::audio::FramePos(1000);
+}
+
+} // namespace
+
+TEST_F(DjlibServiceTest, removalWhileClosedDropsCrates) {
+    writeCrates({"crate_a"});
+    startService();
+    writePackage(1);
+    writeSidecar(1, 1, {"crate_a"});
+    ASSERT_TRUE(QTest::qWaitFor([this] { return hasDjlibBeats(1); }, kTimeoutMillis));
+    const TrackId trackId = track(1)->getId();
+    stopService();
+
+    // The agent moves both files to _removed while Mixxx is closed.
+    ASSERT_TRUE(QDir(m_libPath).mkpath(QStringLiteral("_removed")));
+    ASSERT_TRUE(QFile::rename(tracksPath(packageName(1)),
+            QDir(m_libPath).filePath(QStringLiteral("_removed/") + packageName(1))));
+    ASSERT_TRUE(QFile::rename(tracksPath(sidecarName(1)),
+            QDir(m_libPath).filePath(QStringLiteral("_removed/") + sidecarName(1))));
+
+    startServiceFromConfig();
+    ASSERT_TRUE(QTest::qWaitFor(
+            [this, trackId] { return managedCratesOf(trackId).isEmpty(); },
+            kTimeoutMillis));
+    EXPECT_TRUE(trackCollectionManager()->getTrackById(trackId));
+    EXPECT_TRUE(m_pService->store().crateMapping("crate_a"));
+}
+
+TEST_F(DjlibServiceTest, renameWhileClosedRelocatesAndKeepsDjEdits) {
+    writeCrates({"crate_a"});
+    startService();
+    writePackage(1);
+    writeSidecar(1, 1, {"crate_a"});
+    ASSERT_TRUE(QTest::qWaitFor([this] { return hasDjlibBeats(1); }, kTimeoutMillis));
+    TrackId trackId;
+    {
+        const auto pTrack = track(1);
+        trackId = pTrack->getId();
+        addDjHotCue(pTrack);
+        trackCollectionManager()->saveTrack(pTrack);
+    }
+    stopService();
+
+    // Title fix while Mixxx is closed: new file name, same track_id, v2.
+    const QString newName = QStringLiteral("Artist - Better Title [10000001].stem.mp4");
+    ASSERT_TRUE(QFile::rename(tracksPath(packageName(1)), tracksPath(newName)));
+    ASSERT_TRUE(QFile::remove(tracksPath(sidecarName(1))));
+    QJsonObject json = sidecarJson(1, 2, crateRefs({"crate_a"}));
+    json["file"] = newName;
+    ASSERT_TRUE(writeByRename(
+            tracksPath(QStringLiteral("Artist - Better Title [10000001].djlib.json")),
+            QJsonDocument(json).toJson()));
+
+    startServiceFromConfig();
+    ASSERT_TRUE(QTest::qWaitFor(
+            [this] {
+                const auto state = m_pService->store().trackState(djlibId(1));
+                return state && state->sidecarVersion == 2;
+            },
+            kTimeoutMillis));
+    const auto pTrack = trackByPath(tracksPath(newName));
+    ASSERT_TRUE(pTrack);
+    EXPECT_EQ(trackId, pTrack->getId()); // same row: history, playlists stay
+    EXPECT_TRUE(hasDjHotCue(pTrack));    // DJ edit kept
+    EXPECT_EQ(QStringList{"crate_a"}, managedCratesOf(trackId));
+    EXPECT_EQ(trackId, m_pService->store().trackState(djlibId(1))->trackId);
+}
+
+TEST_F(DjlibServiceTest, libraryFolderMoveRelocatesTracks) {
+    writeCrates({"crate_a"});
+    startService();
+    writePackage(1);
+    writeSidecar(1, 1, {"crate_a"});
+    ASSERT_TRUE(QTest::qWaitFor([this] { return hasDjlibBeats(1); }, kTimeoutMillis));
+    TrackId trackId;
+    {
+        const auto pTrack = track(1);
+        trackId = pTrack->getId();
+        addDjHotCue(pTrack);
+        trackCollectionManager()->saveTrack(pTrack);
+    }
+    stopService();
+
+    // The DJ moves the whole library folder and points Mixxx at it.
+    QTemporaryDir newLib;
+    ASSERT_TRUE(newLib.isValid());
+    for (const auto& dir : {QStringLiteral("tracks"), QStringLiteral("_djlib")}) {
+        ASSERT_TRUE(QDir().rename(QDir(m_libPath).filePath(dir), QDir(newLib.path()).filePath(dir)));
+    }
+    m_libPath = newLib.path();
+
+    startServiceFromConfig();
+    ASSERT_TRUE(QTest::qWaitFor(
+            [this, trackId] {
+                const auto pTrack = track(1);
+                return pTrack && pTrack->getId() == trackId;
+            },
+            kTimeoutMillis));
+    EXPECT_TRUE(hasDjHotCue(track(1)));
+    EXPECT_TRUE(hasDjlibBeats(1));
+    EXPECT_EQ(QStringList{"crate_a"}, managedCratesOf(trackId));
+    stopService(); // before newLib goes away
+}
+
+TEST_F(DjlibServiceTest, missingTracksDirKeepsCrates) {
+    writeCrates({"crate_a"});
+    startService();
+    writePackage(1);
+    writeSidecar(1, 1, {"crate_a"});
+    ASSERT_TRUE(QTest::qWaitFor([this] { return hasDjlibBeats(1); }, kTimeoutMillis));
+    const TrackId trackId = track(1)->getId();
+    const QString tracksDir = QDir(m_libPath).filePath(QStringLiteral("tracks"));
+    const QString awayDir = QDir(m_libPath).filePath(QStringLiteral("tracks-away"));
+
+    // Drive gone while running.
+    ASSERT_TRUE(QDir().rename(tracksDir, awayDir));
+    m_pService->requestPass();
+    QTest::qWait(300);
+    ASSERT_TRUE(waitIdle());
+    EXPECT_EQ(QStringList{"crate_a"}, managedCratesOf(trackId));
+    EXPECT_EQ(1, m_pService->store().trackState(djlibId(1))->sidecarVersion);
+
+    // ... and at start.
+    stopService();
+    startServiceFromConfig();
+    QTest::qWait(300);
+    ASSERT_TRUE(waitIdle());
+    EXPECT_EQ(QStringList{"crate_a"}, managedCratesOf(trackId));
+
+    // Back again: nothing to do, still a member.
+    ASSERT_TRUE(QDir().rename(awayDir, tracksDir));
+    m_pService->requestPass();
+    QTest::qWait(300);
+    ASSERT_TRUE(waitIdle());
+    EXPECT_EQ(QStringList{"crate_a"}, managedCratesOf(trackId));
+    EXPECT_EQ(1, m_pService->store().trackState(djlibId(1))->sidecarVersion);
+}
+
+TEST_F(DjlibServiceTest, unreadableSidecarIsRetried) {
+    writeCrates({"crate_a"});
+    auto pFailures = std::make_shared<std::atomic<int>>(0);
+    djlib::setReadFailureForTesting([pFailures](const QString& path) {
+        // The first two reads fail like a Windows sharing violation.
+        return path.endsWith(sidecarName(1)) && pFailures->fetch_add(1) < 2;
+    });
+    startService();
+    writePackage(1);
+    writeSidecar(1, 1, {"crate_a"});
+    // No further change to the file: only the retry can import it.
+    ASSERT_TRUE(QTest::qWaitFor([this] { return hasDjlibBeats(1); }, kTimeoutMillis));
+    EXPECT_GE(pFailures->load(), 3);
+    EXPECT_EQ(QStringList{"crate_a"}, managedCrates(1));
+}
+
+TEST_F(DjlibServiceTest, unreadableCratesJsonIsRetried) {
+    writeCrates({"crate_a"});
+    auto pFailures = std::make_shared<std::atomic<int>>(0);
+    djlib::setReadFailureForTesting([pFailures](const QString& path) {
+        return path.endsWith(QStringLiteral("crates.json")) && pFailures->fetch_add(1) < 1;
+    });
+    startService();
+    ASSERT_TRUE(QTest::qWaitFor(
+            [this] { return m_pService->store().crateMapping("crate_a").has_value(); },
+            kTimeoutMillis));
+    EXPECT_GE(pFailures->load(), 2);
 }

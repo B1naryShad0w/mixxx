@@ -560,6 +560,18 @@ void TrackCollectionManager::afterTracksUpdated(const QSet<TrackId>& updatedTrac
     }
 }
 
+bool TrackCollectionManager::relocateTrack(
+        TrackId trackId, const mixxx::FileInfo& newFileInfo) const {
+    DEBUG_ASSERT_QOBJECT_THREAD_AFFINITY(this);
+
+    const auto relocatedTrack = m_pInternalCollection->relocateTrack(trackId, newFileInfo);
+    if (!relocatedTrack) {
+        return false;
+    }
+    afterTracksRelocated({*relocatedTrack});
+    return true;
+}
+
 void TrackCollectionManager::afterTracksRelocated(
         const QList<RelocatedTrack>& relocatedTracks) const {
     DEBUG_ASSERT_QOBJECT_THREAD_AFFINITY(this);
