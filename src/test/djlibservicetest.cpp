@@ -5,6 +5,8 @@
 #include <QElapsedTimer>
 #include <QFile>
 #include <QJsonArray>
+#include <QLabel>
+#include <QLineEdit>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QSignalSpy>
@@ -15,7 +17,10 @@
 #include "library/djlib/djlibimporter.h"
 #include "library/djlib/djlibservice.h"
 #include "library/djlib/djlibstore.h"
+#include "library/djlib/dlgprefdjlib.h"
 #include "library/trackset/crate/crate.h"
+#include "proto/keys.pb.h" // needed by keydetectionsettings.h
+#include "preferences/keydetectionsettings.h"
 #include "test/librarytest.h"
 #include "track/beats.h"
 #include "track/track.h"
@@ -462,4 +467,31 @@ TEST_F(DjlibServiceTest, hiddenTrackKeepsState) {
     // tracksRemoved is also emitted for hidden tracks: only a purge drops state.
     ASSERT_TRUE(trackCollectionManager()->hideTracks({track(1)->getId()}));
     EXPECT_TRUE(m_pService->store().trackState(djlibId(1)));
+}
+
+TEST_F(DjlibServiceTest, preferencesPageSetsPathAndWarns) {
+    startService();
+    m_pService->setLibraryPath(QString());
+
+    DlgPrefDjlib page(nullptr, config());
+    auto* pLineEdit = page.findChild<QLineEdit*>(QStringLiteral("lineEditLibraryPath"));
+    auto* pWarning = page.findChild<QLabel*>(QStringLiteral("labelWarning"));
+    auto* pWatched = page.findChild<QLabel*>(QStringLiteral("labelWatched"));
+    ASSERT_TRUE(pLineEdit && pWarning && pWatched);
+    EXPECT_EQ(QString(), pLineEdit->text());
+    EXPECT_TRUE(pWarning->isHidden());
+
+    pLineEdit->setText(m_libDir.path());
+    page.slotApply();
+    EXPECT_EQ(m_libDir.path(), m_pService->libraryPath());
+    EXPECT_EQ(m_libDir.path(), config()->getValueString(DjlibService::kLibraryPathKey));
+    EXPECT_TRUE(pWatched->text().contains(QStringLiteral("tracks")));
+
+    KeyDetectionSettings(config()).setReanalyzeWhenSettingsChange(true);
+    page.slotUpdate();
+    EXPECT_FALSE(pWarning->isHidden());
+
+    page.slotResetToDefaults();
+    page.slotApply();
+    EXPECT_EQ(QString(), m_pService->libraryPath());
 }

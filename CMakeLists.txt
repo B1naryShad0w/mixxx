@@ -1479,6 +1479,8 @@ add_library(
   src/library/djlib/djlibservice.cpp
   src/library/djlib/djlibsidecar.cpp
   src/library/djlib/djlibstore.cpp
+  src/library/djlib/dlgprefdjlib.cpp
+  src/library/djlib/dlgprefdjlibdlg.ui
   src/library/tabledelegates/defaultdelegate.cpp
   src/library/dlgcoverartfullsize.cpp
   src/library/dlgcoverartfullsize.ui

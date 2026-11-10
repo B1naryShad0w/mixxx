@@ -13,6 +13,7 @@
 #include <QtGlobal>
 
 #include "controllers/dlgprefcontrollers.h"
+#include "library/djlib/dlgprefdjlib.h"
 #include "library/library.h"
 #include "library/trackcollectionmanager.h"
 #include "moc_dlgpreferences.cpp"
@@ -118,6 +119,11 @@ DlgPreferences::DlgPreferences(
     addPageWidget(PreferencesPage(plibraryPage,
                           new QTreeWidgetItem(contentsTreeWidget, QTreeWidgetItem::Type)),
             tr("Library"),
+            "ic_preferences_library.svg");
+    // djlib fork
+    addPageWidget(PreferencesPage(new DlgPrefDjlib(this, m_pConfig),
+                          new QTreeWidgetItem(contentsTreeWidget, QTreeWidgetItem::Type)),
+            tr("djlib"),
             "ic_preferences_library.svg");
 
     QTreeWidgetItem* pControllerRootItem =
