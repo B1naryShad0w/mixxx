@@ -17,7 +17,8 @@ class DjlibStore;
 ///   (unlock-set-relock). Unknown tempo: beats are not touched.
 /// - Cues: main cue + hot cues (sidecar `number` 1 -> hot cue index 0) with
 ///   their labels. A sidecar without cues leaves the cues alone.
-/// - Key: `setKey(guessKeyFromText(key), FILE_METADATA)`. Null key: untouched.
+/// - Key: `guessKeyFromText(key)` as FILE_METADATA keys with sub-version
+///   "djlib/1" (`setKeys`), which the AnalyzerKey guard keeps. Null: untouched.
 /// - ReplayGain: ratio = `db2ratio(gain_db)`, peak linear. Null: untouched.
 /// - Crates: membership in managed crates = sidecar crates ∩ `allowedCrateIds`
 ///   (the ids of the current crates.json).
@@ -43,6 +44,8 @@ class DjlibStore;
 class DjlibImporter {
   public:
     static const QString kBeatsSubVersion; // "djlib/1"
+    /// Keys sub-version of imported keys; AnalyzerKey never re-analyses them.
+    static const QString kKeySubVersion; // "djlib/1"
 
     enum class Field {
         Untouched,  // nothing to apply (null/unknown/empty in the sidecar)

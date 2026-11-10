@@ -38,10 +38,10 @@ DjlibCrateSync::DjlibCrateSync(TrackCollection* pTrackCollection,
 }
 
 void DjlibCrateSync::slotCrateDeleted(CrateId crateId) {
-    // Our own deletes drop the mapping first; this catches a DJ who unlocked
-    // and deleted a managed crate. The next reconcile recreates it if it is
-    // still listed in crates.json.
-    if (m_pStore->crateMappingByCrateId(crateId)) {
+    // This catches a DJ who unlocked and deleted a managed crate. The next
+    // reconcile recreates it if it is still listed in crates.json. Our own
+    // deletes (m_deletingOwnCrate) drop the mapping themselves.
+    if (crateId != m_deletingOwnCrate && m_pStore->crateMappingByCrateId(crateId)) {
         kLogger.info() << "Managed crate" << crateId << "was deleted, dropping its mapping";
         m_pStore->removeCrateMappingByCrateId(crateId);
     }
@@ -85,9 +85,17 @@ bool DjlibCrateSync::reconcile(
         }
         if (!desiredIds.contains(mapping.djlibId)) {
             kLogger.info() << "Deleting managed crate" << crate.getName();
-            // Drop the mapping first so slotCrateDeleted ignores our own delete.
-            ok &= m_pStore->removeCrateMapping(mapping.djlibId);
-            ok &= m_pTrackCollection->deleteCrate(crate.getId());
+            // Delete first: if that fails the crate stays mapped (and is
+            // deleted on the next reconcile) instead of becoming an unmapped,
+            // locked "DJ crate".
+            m_deletingOwnCrate = crate.getId();
+            const bool deleted = m_pTrackCollection->deleteCrate(crate.getId());
+            m_deletingOwnCrate = CrateId();
+            if (deleted) {
+                ok &= m_pStore->removeCrateMapping(mapping.djlibId);
+            } else {
+                ok = false;
+            }
             continue;
         }
         managed.insert(mapping.djlibId, crate);
@@ -174,8 +182,11 @@ bool DjlibCrateSync::reconcile(
             // Cycle: park the first one under a temporary name.
             const QString djlibId = pendingRenames.first();
             if (!renameTo(djlibId, temporaryName(djlibId))) {
+                // Leave the remaining renames to the next reconcile; still
+                // create missing crates and update mappings below.
                 kLogger.warning() << "Failed to move managed crate to a temporary name";
-                return false;
+                ok = false;
+                break;
             }
         }
     }
@@ -204,7 +215,15 @@ bool DjlibCrateSync::reconcile(
             continue;
         }
         kLogger.info() << "Created managed crate" << name;
-        ok &= m_pStore->upsertCrateMapping({ref.id, crateId, ref.name});
+        if (!m_pStore->upsertCrateMapping({ref.id, crateId, ref.name})) {
+            // Never leave an unmapped locked crate behind (it would look
+            // like a DJ crate forever): undo, retried on the next reconcile.
+            m_deletingOwnCrate = crateId;
+            m_pTrackCollection->deleteCrate(crateId);
+            m_deletingOwnCrate = CrateId();
+            ok = false;
+            continue;
+        }
         if (pCreatedIds) {
             pCreatedIds->append(ref.id);
         }

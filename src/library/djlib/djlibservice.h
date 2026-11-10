@@ -11,7 +11,9 @@
 #include <QStringList>
 #include <QThreadPool>
 #include <QTimer>
+#include <atomic>
 #include <functional>
+#include <memory>
 #include <optional>
 
 #include "library/djlib/djlibcratesync.h"
@@ -45,6 +47,9 @@ struct ServiceTiming {
     int safetyPassMillis = 60000;
     int retryMinMillis = 1000; // after a read failure; doubles up to retryMaxMillis
     int retryMaxMillis = 60000;
+    // An existing but empty tracks/ must still be empty this much later
+    // before it counts as "every package removed".
+    int emptyConfirmMillis = 60000;
 };
 
 /// Tests only: makes reading `path` fail (as a sharing violation would)
@@ -76,6 +81,7 @@ struct PassResult {
     QStringList addedPackages; // new or changed, without a sidecar
     QList<ParsedSidecar> sidecars;
     QList<SidecarCrates> memberships; // all sidecars with a package, iff crates changed
+    bool lostNames = false;           // a package of the old snapshot is gone
     QStringList readFailures;         // not in the snapshot/stamp: retried
 };
 
@@ -127,6 +133,8 @@ class DjlibService : public QObject {
         bool watching = false;
         QDateTime lastImport; // invalid: none since start
         QString lastImportFile;
+        int trackFiles = 0;        // packages in tracks/ at the last pass
+        QString problem;           // e.g. no tracks/ folder in the chosen path
         int waitingForPackage = 0; // sidecars without package
         int deferred = 0;          // waiting for a deck to unload / a sample rate
         int queued = 0;            // queue items not processed yet
@@ -145,11 +153,20 @@ class DjlibService : public QObject {
     /// The running service (for the preferences page), or nullptr.
     static DjlibService* instance();
 
+    /// `<musicDir>/djlib` (the agent's default library) if it exists, else
+    /// empty. Used when `[djlib] LibraryPath` is absent (first run).
+    static QString defaultLibraryPath(const QString& musicDir);
+    static QString defaultLibraryPath();
+    /// Cleans a chosen path; a picked `.../tracks` folder next to `_djlib`
+    /// becomes its parent (the library folder).
+    static QString normalizeLibraryPath(const QString& path);
+
     /// Tells whether a track is loaded in a deck/sampler (default: never).
     /// Wired to `PlayerInfo::isTrackLoaded` in CoreServices.
     void setTrackLoadedFn(TrackLoadedFn fn);
 
-    /// Reads `[djlib] LibraryPath` and (re)starts watching.
+    /// Reads `[djlib] LibraryPath` and (re)starts watching. If the setting is
+    /// absent, uses (and stores) `defaultLibraryPath()` when that exists.
     void start();
 
     /// Stores the path in the settings and re-arms the watcher.
@@ -260,6 +277,11 @@ class DjlibService : public QObject {
     bool m_reconciling = false;
     bool m_tracksDirMissing = false;
     int m_retryDelayMillis = 0;
+    bool m_sweepNeeded = false; // first pass after rearm, or names were lost
+    QElapsedTimer m_emptySince; // tracks/ listed empty while rows are mapped
+    QTimer m_confirmTimer;
+    int m_packageCount = 0;
+    std::shared_ptr<std::atomic<bool>> m_pStopping;
 
     QHash<QString, djlib::FileStamp> m_snapshot;
     std::optional<djlib::FileStamp> m_cratesStamp;

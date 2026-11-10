@@ -47,7 +47,7 @@
       <item row="1" column="0" colspan="3">
        <widget class="QLabel" name="labelFolderHelp">
         <property name="text">
-         <string>The folder the djlib agent syncs to (it contains "tracks" and "_djlib"). New and changed tracks are imported while Mixxx runs. Leave empty to turn djlib sync off.</string>
+         <string>Choose the djlib library folder: the folder the djlib agent syncs to, which contains "tracks" and "_djlib" (by default "djlib" in your Music folder). New and changed tracks are imported while Mixxx runs. Leave empty to turn djlib sync off.</string>
         </property>
         <property name="wordWrap">
          <bool>true</bool>

@@ -41,12 +41,14 @@ void DlgPrefDjlib::slotShow() {
 }
 
 void DlgPrefDjlib::slotApply() {
-    const QString path = QDir::fromNativeSeparators(m_pUi->lineEditLibraryPath->text().trimmed());
+    // A picked ".../tracks" folder becomes the library folder above it.
+    const QString path = DjlibService::normalizeLibraryPath(m_pUi->lineEditLibraryPath->text());
     if (DjlibService* pService = DjlibService::instance()) {
         pService->setLibraryPath(path); // also stores the setting
     } else {
         m_pConfig->setValue(DjlibService::kLibraryPathKey, path);
     }
+    m_pUi->lineEditLibraryPath->setText(QDir::toNativeSeparators(path));
     slotUpdateStatus();
 }
 
@@ -66,6 +68,10 @@ void DlgPrefDjlib::slotBrowse() {
 }
 
 void DlgPrefDjlib::slotUpdateStatus() {
+    // The page exists from startup on: only refresh while it is shown.
+    if (!isVisible() && sender()) {
+        return;
+    }
     const DjlibService* pService = DjlibService::instance();
     if (!pService || pService->libraryPath().isEmpty()) {
         m_pUi->labelWatched->setText(tr("Off (no folder chosen)"));
@@ -74,11 +80,23 @@ void DlgPrefDjlib::slotUpdateStatus() {
         return;
     }
     const auto status = pService->status();
-    const QString tracks = QDir::toNativeSeparators(
-            QDir(status.libraryPath).filePath(QStringLiteral("tracks")));
-    m_pUi->labelWatched->setText(status.watching
-                    ? tracks
-                    : tr("%1 (folder not found yet)").arg(tracks));
+    const QString library = QDir::toNativeSeparators(status.libraryPath);
+    if (status.problem == QLatin1String("no-library-folder")) {
+        m_pUi->labelWatched->setText(
+                tr("%1 does not exist (yet). Choose the djlib library folder, "
+                   "the one that contains \"tracks\" and \"_djlib\".")
+                        .arg(library));
+    } else if (status.problem == QLatin1String("no-tracks-folder")) {
+        m_pUi->labelWatched->setText(
+                tr("There is no \"tracks\" folder in %1. Choose the folder that "
+                   "contains \"tracks\" and \"_djlib\" (the djlib agent's library "
+                   "folder). It is picked up automatically once the agent "
+                   "creates it.")
+                        .arg(library));
+    } else {
+        m_pUi->labelWatched->setText(
+                tr("Watching %n track(s) in %1", "", status.trackFiles).arg(library));
+    }
     if (status.lastImport.isValid()) {
         m_pUi->labelLastImport->setText(tr("%1, %2").arg(
                 QLocale().toString(status.lastImport, QLocale::ShortFormat),

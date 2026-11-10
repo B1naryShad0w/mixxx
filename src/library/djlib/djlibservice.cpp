@@ -4,6 +4,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QSqlQuery>
+#include <QStandardPaths>
 #include <QtConcurrent>
 #include <algorithm>
 
@@ -130,9 +131,13 @@ SidecarCrates cratesOf(const DjlibSidecar& sidecar) {
 QList<SidecarCrates> collectMemberships(const QString& tracksDir,
         const QHash<QString, FileStamp>& snapshot,
         const QSet<QString>& onlyCrateIds,
-        const QHash<QString, SidecarCrates>& known) {
+        const QHash<QString, SidecarCrates>& known,
+        const std::shared_ptr<std::atomic<bool>>& pStopping) {
     QList<SidecarCrates> result;
     for (auto it = snapshot.constBegin(); it != snapshot.constEnd(); ++it) {
+        if (pStopping->load()) {
+            return {};
+        }
         if (!isSidecarName(it.key()) || !snapshot.contains(packageNameOf(it.key()))) {
             continue;
         }
@@ -165,7 +170,8 @@ PassResult runPass(quint64 generation,
         const QString& tracksDir,
         const QString& cratesPath,
         const QHash<QString, FileStamp>& snapshot,
-        const std::optional<FileStamp>& cratesStamp) {
+        const std::optional<FileStamp>& cratesStamp,
+        const std::shared_ptr<std::atomic<bool>>& pStopping) {
     PassResult result;
     result.generation = generation;
     result.tracksDirOk = isUsableDir(tracksDir);
@@ -221,7 +227,16 @@ PassResult runPass(quint64 generation,
     sidecarNames.sort();
     QSet<QString> handledPackages; // a sidecar item imports them
     QHash<QString, SidecarCrates> known;
+    for (auto it = snapshot.constBegin(); it != snapshot.constEnd(); ++it) {
+        if (isPackageName(it.key()) && !result.snapshot.contains(it.key())) {
+            result.lostNames = true;
+            break;
+        }
+    }
     for (const auto& name : std::as_const(sidecarNames)) {
+        if (pStopping->load()) {
+            return result; // shutting down: the result is discarded
+        }
         ParsedSidecar parsed;
         parsed.sidecarName = name;
         switch (readSidecar(QDir(tracksDir).filePath(name), &parsed.sidecar, &parsed.json)) {
@@ -247,7 +262,8 @@ PassResult runPass(quint64 generation,
         }
     }
     if (result.crates) {
-        result.memberships = collectMemberships(tracksDir, result.snapshot, {}, known);
+        result.memberships =
+                collectMemberships(tracksDir, result.snapshot, {}, known, pStopping);
     }
     return result;
 }
@@ -264,7 +280,8 @@ DjlibService::DjlibService(UserSettingsPointer pConfig,
           m_timing(timing),
           m_store(pTrackCollectionManager->internalCollection()->database()),
           m_crateSync(pTrackCollectionManager->internalCollection(), &m_store),
-          m_importer(&m_crateSync) {
+          m_importer(&m_crateSync),
+          m_pStopping(std::make_shared<std::atomic<bool>>(false)) {
     if (!m_store.initialize()) {
         kLogger.warning() << "Cannot create the djlib tables";
     }
@@ -274,6 +291,8 @@ DjlibService::DjlibService(UserSettingsPointer pConfig,
     m_probePool.setMaxThreadCount(1);
     m_retryTimer.setSingleShot(true);
     connect(&m_retryTimer, &QTimer::timeout, this, &DjlibService::requestPass);
+    m_confirmTimer.setSingleShot(true);
+    connect(&m_confirmTimer, &QTimer::timeout, this, &DjlibService::requestPass);
 
     m_debounceTimer.setSingleShot(true);
     connect(&m_debounceTimer, &QTimer::timeout, this, &DjlibService::startPass);
@@ -330,6 +349,7 @@ DjlibService::~DjlibService() {
         s_pInstance = nullptr;
     }
     m_generation++;
+    m_pStopping->store(true); // running passes stop reading sidecars
     m_pool.waitForDone();
     m_probePool.waitForDone();
 }
@@ -347,13 +367,55 @@ void DjlibService::setTrackLoadedFn(TrackLoadedFn fn) {
     m_trackLoadedFn = std::move(fn);
 }
 
+// static
+QString DjlibService::defaultLibraryPath(const QString& musicDir) {
+    if (musicDir.isEmpty()) {
+        return QString();
+    }
+    const QString path = QDir(musicDir).filePath(QStringLiteral("djlib"));
+    return QFileInfo(path).isDir() ? QDir::cleanPath(path) : QString();
+}
+
+// static
+QString DjlibService::defaultLibraryPath() {
+    // Windows: %USERPROFILE%\Music\djlib, the agent's default library.
+    return defaultLibraryPath(QStandardPaths::writableLocation(QStandardPaths::MusicLocation));
+}
+
+// static
+QString DjlibService::normalizeLibraryPath(const QString& path) {
+    const QString trimmed = path.trimmed();
+    if (trimmed.isEmpty()) {
+        return QString();
+    }
+    const QString clean = QDir::cleanPath(QDir::fromNativeSeparators(trimmed));
+    const QFileInfo info(clean);
+    // A DJ picking <lib>/tracks instead of <lib>.
+    if (info.fileName().compare(kTracksDir, Qt::CaseInsensitive) == 0) {
+        const QDir parent = info.dir();
+        if (QFileInfo(parent.filePath(kDjlibDir)).isDir()) {
+            return QDir::cleanPath(parent.path());
+        }
+    }
+    return clean;
+}
+
 void DjlibService::start() {
-    m_libraryPath = m_pConfig->getValueString(kLibraryPathKey).trimmed();
+    if (m_pConfig->exists(kLibraryPathKey)) {
+        m_libraryPath = normalizeLibraryPath(m_pConfig->getValueString(kLibraryPathKey));
+    } else {
+        // First run: the agent's default folder, if it is there.
+        m_libraryPath = defaultLibraryPath();
+        if (!m_libraryPath.isEmpty()) {
+            kLogger.info() << "Using the default djlib library" << m_libraryPath;
+            m_pConfig->setValue(kLibraryPathKey, m_libraryPath);
+        }
+    }
     rearm();
 }
 
 void DjlibService::setLibraryPath(const QString& libraryPath) {
-    const QString path = libraryPath.trimmed();
+    const QString path = normalizeLibraryPath(libraryPath);
     m_pConfig->setValue(kLibraryPathKey, path);
     if (path == m_libraryPath && (path.isEmpty() || m_safetyTimer.isActive())) {
         return;
@@ -379,6 +441,10 @@ void DjlibService::rearm() {
     m_retryTimer.stop();
     m_retryDelayMillis = 0;
     m_tracksDirMissing = false;
+    m_confirmTimer.stop();
+    m_emptySince.invalidate();
+    m_sweepNeeded = true;
+    m_packageCount = 0;
     m_burst.invalidate();
     if (!m_watcher.directories().isEmpty()) {
         m_watcher.removePaths(m_watcher.directories());
@@ -460,7 +526,8 @@ void DjlibService::startPass() {
             tracksDir(),
             QDir(djlibDir()).filePath(kCratesFile),
             m_snapshot,
-            m_cratesStamp)
+            m_cratesStamp,
+            m_pStopping)
             .then(this, [this](PassResult result) {
                 onPassFinished(std::move(result));
             });
@@ -481,12 +548,23 @@ void DjlibService::onPassFinished(PassResult result) {
         }
         m_snapshot = std::move(result.snapshot);
         m_cratesStamp = result.cratesStamp;
-        // crates.json first: memberships need the managed crates.
+        m_packageCount = static_cast<int>(std::count_if(m_snapshot.keyBegin(),
+                m_snapshot.keyEnd(),
+                [](const QString& name) { return isPackageName(name); }));
+        // crates.json first: memberships need the managed crates. Without a
+        // usable tracks/ no memberships were collected.
         if (result.crates) {
-            enqueue(Item{Item::Kind::Reconcile, {}, {}, *result.crates, {}, true});
+            enqueue(Item{Item::Kind::Reconcile,
+                    {},
+                    {},
+                    *result.crates,
+                    {},
+                    result.tracksDirOk});
         }
-        // Packages gone, also while Mixxx was closed (persisted rows vs listing).
-        if (result.tracksDirOk) {
+        // Packages gone, also while Mixxx was closed (persisted rows vs
+        // listing): on the first pass and whenever names were lost.
+        m_sweepNeeded |= result.lostNames;
+        if (result.tracksDirOk && m_sweepNeeded) {
             enqueue(Item{Item::Kind::Sweep, {}, {}, {}, {}, false});
         }
         for (const auto& name : std::as_const(result.addedPackages)) {
@@ -533,7 +611,8 @@ void DjlibService::startMembershipJob(const QSet<QString>& crateIds) {
             tracksDir(),
             m_snapshot,
             crateIds,
-            QHash<QString, SidecarCrates>())
+            QHash<QString, SidecarCrates>(),
+            m_pStopping)
             .then(this, [this, generation](QList<SidecarCrates> memberships) {
                 --m_jobsRunning;
                 if (generation == m_generation) {
@@ -667,18 +746,40 @@ void DjlibService::sweepMissingPackages() {
     // while Mixxx was closed are caught too. Only called with a usable
     // tracks/ dir. The track stays in the library (playlists, history) for
     // Mixxx's missing-track handling; only the djlib crates change.
-    for (auto state : m_store.trackStates()) {
-        if (!state.trackId.isValid() || state.sidecarVersion < 0 ||
-                m_snapshot.contains(state.file)) {
-            continue;
+    QList<DjlibStore::TrackFile> gone;
+    for (const auto& entry : m_store.trackFiles()) {
+        if (entry.trackId.isValid() && entry.sidecarVersion >= 0 &&
+                !m_snapshot.contains(entry.file)) {
+            gone.append(entry);
         }
-        kLogger.info() << state.file << "is gone: leaving the djlib crates";
-        m_crateSync.setMembership(state.trackId, {});
-        m_deferred.remove(state.djlibId);
+    }
+    if (gone.isEmpty()) {
+        m_sweepNeeded = false;
+        m_emptySince.invalidate();
+        return;
+    }
+    // An existing but empty tracks/ (agent recreating it, a failed listing)
+    // only counts once it is still empty a while later.
+    if (m_packageCount == 0) {
+        if (!m_emptySince.isValid()) {
+            kLogger.warning() << tracksDir() << "is empty - keeping the djlib crates for now";
+            m_emptySince.start();
+        }
+        if (m_emptySince.elapsed() < m_timing.emptyConfirmMillis) {
+            m_confirmTimer.start(static_cast<int>(
+                    m_timing.emptyConfirmMillis - m_emptySince.elapsed()));
+            return; // m_sweepNeeded stays set
+        }
+    }
+    m_sweepNeeded = false;
+    m_emptySince.invalidate();
+    for (const auto& entry : std::as_const(gone)) {
+        kLogger.info() << entry.file << "is gone: leaving the djlib crates";
+        m_crateSync.setMembership(entry.trackId, {});
+        m_deferred.remove(entry.djlibId);
         // -1 = package gone: if it comes back (or under a new name), its
         // sidecar is applied again; the fingerprints stay, so DJ edits win.
-        state.sidecarVersion = -1;
-        m_store.upsertTrackState(state);
+        m_store.setSidecarVersion(entry.djlibId, -1);
     }
 }
 
@@ -707,7 +808,12 @@ void DjlibService::sidecarChanged(const ParsedSidecar& parsed) {
     }
     const auto existing = m_store.trackState(sidecar.trackId);
     if (!m_snapshot.contains(packageName)) {
-        // Sidecar without package: wait for the package.
+        // Sidecar without package: wait for the package. A stale one (e.g.
+        // left behind by an interrupted rename) isn't newer: ignore it.
+        if (existing && existing->trackId.isValid() &&
+                sidecar.sidecarVersion <= existing->sidecarVersion) {
+            return;
+        }
         if (existing) {
             m_store.setPendingJson(sidecar.trackId, parsed.json);
         } else {
@@ -857,11 +963,13 @@ DjlibService::Status DjlibService::status() const {
     status.watching = !m_libraryPath.isEmpty() && !m_watcher.directories().isEmpty();
     status.lastImport = m_lastImport;
     status.lastImportFile = m_lastImportFile;
-    for (const auto& state : m_store.trackStates()) {
-        if (state.pendingJson) {
-            ++status.waitingForPackage;
-        }
+    status.trackFiles = m_packageCount;
+    if (!m_libraryPath.isEmpty() && !QFileInfo(tracksDir()).isDir()) {
+        status.problem = QFileInfo(m_libraryPath).isDir()
+                ? QStringLiteral("no-tracks-folder")
+                : QStringLiteral("no-library-folder");
     }
+    status.waitingForPackage = m_store.countPending();
     status.deferred = static_cast<int>(m_deferred.size());
     status.queued = static_cast<int>(m_queue.size()) + (m_passRunning ? 1 : 0) + m_jobsRunning;
     return status;

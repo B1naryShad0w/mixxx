@@ -128,6 +128,7 @@ class DjlibServiceTest : public LibraryTest {
         timing.safetyPassMillis = 60000;
         timing.retryMinMillis = 50;
         timing.retryMaxMillis = 400;
+        timing.emptyConfirmMillis = m_emptyConfirmMillis;
         m_pService = std::make_unique<DjlibService>(
                 config(), trackCollectionManager(), nullptr, timing);
         m_pService->setTrackLoadedFn([this](const TrackPointer& pTrack) {
@@ -214,6 +215,7 @@ class DjlibServiceTest : public LibraryTest {
     QTemporaryDir m_libDir;
     QString m_libPath = m_libDir.path();
     QSet<TrackId> m_loaded;
+    int m_emptyConfirmMillis = 300;
     std::unique_ptr<DjlibService> m_pService;
 };
 
@@ -510,7 +512,13 @@ TEST_F(DjlibServiceTest, preferencesPageSetsPathAndWarns) {
     page.slotApply();
     EXPECT_EQ(m_libDir.path(), m_pService->libraryPath());
     EXPECT_EQ(m_libDir.path(), config()->getValueString(DjlibService::kLibraryPathKey));
-    EXPECT_TRUE(pWatched->text().contains(QStringLiteral("tracks")));
+    EXPECT_TRUE(pWatched->text().startsWith(QStringLiteral("Watching")))
+            << pWatched->text().toStdString();
+
+    // Picking <lib>/tracks by mistake selects the library folder.
+    pLineEdit->setText(QDir(m_libDir.path()).filePath(QStringLiteral("tracks")));
+    page.slotApply();
+    EXPECT_EQ(QDir::cleanPath(m_libDir.path()), m_pService->libraryPath());
 
     KeyDetectionSettings(config()).setReanalyzeWhenSettingsChange(true);
     page.slotUpdate();
@@ -698,4 +706,101 @@ TEST_F(DjlibServiceTest, unreadableCratesJsonIsRetried) {
             [this] { return m_pService->store().crateMapping("crate_a").has_value(); },
             kTimeoutMillis));
     EXPECT_GE(pFailures->load(), 2);
+}
+
+TEST_F(DjlibServiceTest, libraryPathLogic) {
+    // <music>/djlib is the default only if it exists.
+    QTemporaryDir music;
+    ASSERT_TRUE(music.isValid());
+    EXPECT_EQ(QString(), DjlibService::defaultLibraryPath(music.path()));
+    ASSERT_TRUE(QDir(music.path()).mkpath(QStringLiteral("djlib")));
+    EXPECT_EQ(QDir(music.path()).filePath(QStringLiteral("djlib")),
+            DjlibService::defaultLibraryPath(music.path()));
+    EXPECT_EQ(QString(), DjlibService::defaultLibraryPath(QString()));
+
+    // tracks/ next to _djlib -> the parent; other folders stay.
+    const QString lib = QDir::cleanPath(m_libDir.path());
+    EXPECT_EQ(lib, DjlibService::normalizeLibraryPath(lib + QStringLiteral("/tracks")));
+    EXPECT_EQ(lib, DjlibService::normalizeLibraryPath(lib + QStringLiteral("/tracks/")));
+    EXPECT_EQ(lib, DjlibService::normalizeLibraryPath(QStringLiteral("  ") + lib + "/ "));
+    EXPECT_EQ(lib + QStringLiteral("/_djlib"),
+            DjlibService::normalizeLibraryPath(lib + QStringLiteral("/_djlib")));
+    const QString otherTracks = QDir::cleanPath(music.path()) + QStringLiteral("/tracks");
+    ASSERT_TRUE(QDir().mkpath(otherTracks)); // no _djlib sibling
+    EXPECT_EQ(otherTracks, DjlibService::normalizeLibraryPath(otherTracks));
+    EXPECT_EQ(QString(), DjlibService::normalizeLibraryPath(QStringLiteral("  ")));
+}
+
+TEST_F(DjlibServiceTest, absentSettingUsesDefaultEmptySettingStaysOff) {
+    // Absent: the default (if present) is used and stored. With no
+    // <music>/djlib on the test machine this stays off; an explicit empty
+    // setting always stays off.
+    createService();
+    m_pService->start();
+    EXPECT_EQ(DjlibService::defaultLibraryPath(), m_pService->libraryPath());
+    stopService();
+
+    config()->setValue(DjlibService::kLibraryPathKey, QString());
+    createService();
+    m_pService->start();
+    EXPECT_EQ(QString(), m_pService->libraryPath());
+    EXPECT_FALSE(m_pService->status().watching);
+}
+
+TEST_F(DjlibServiceTest, statusShowsMissingTracksFolder) {
+    QTemporaryDir other;
+    ASSERT_TRUE(other.isValid());
+    createService();
+    m_pService->setLibraryPath(other.path());
+    EXPECT_EQ(QStringLiteral("no-tracks-folder"), m_pService->status().problem);
+    m_pService->setLibraryPath(other.path() + QStringLiteral("/nope"));
+    EXPECT_EQ(QStringLiteral("no-library-folder"), m_pService->status().problem);
+    m_pService->setLibraryPath(m_libDir.path());
+    EXPECT_EQ(QString(), m_pService->status().problem);
+}
+
+TEST_F(DjlibServiceTest, brieflyEmptyTracksDirKeepsCrates) {
+    m_emptyConfirmMillis = 3000;
+    writeCrates({"crate_a"});
+    startService();
+    writePackage(1);
+    writeSidecar(1, 1, {"crate_a"});
+    ASSERT_TRUE(QTest::qWaitFor([this] { return hasDjlibBeats(1); }, kTimeoutMillis));
+    const TrackId trackId = track(1)->getId();
+    EXPECT_EQ(1, m_pService->status().trackFiles);
+
+    // The folder is emptied (e.g. recreated by the agent) and refilled.
+    QTemporaryDir away;
+    ASSERT_TRUE(QFile::rename(tracksPath(packageName(1)), away.filePath(packageName(1))));
+    ASSERT_TRUE(QFile::rename(tracksPath(sidecarName(1)), away.filePath(sidecarName(1))));
+    m_pService->requestPass();
+    QTest::qWait(300);
+    ASSERT_TRUE(waitIdle());
+    EXPECT_EQ(QStringList{"crate_a"}, managedCratesOf(trackId));
+    ASSERT_TRUE(QFile::rename(away.filePath(packageName(1)), tracksPath(packageName(1))));
+    ASSERT_TRUE(QFile::rename(away.filePath(sidecarName(1)), tracksPath(sidecarName(1))));
+    m_pService->requestPass();
+    QTest::qWait(3500); // past the confirmation time
+    ASSERT_TRUE(waitIdle());
+    EXPECT_EQ(QStringList{"crate_a"}, managedCratesOf(trackId));
+    EXPECT_EQ(1, m_pService->store().trackState(djlibId(1))->sidecarVersion);
+}
+
+TEST_F(DjlibServiceTest, staleSidecarWithoutPackageIsIgnored) {
+    writeCrates({"crate_a"});
+    startService();
+    writePackage(1);
+    writeSidecar(1, 2, {"crate_a"});
+    ASSERT_TRUE(QTest::qWaitFor([this] { return hasDjlibBeats(1); }, kTimeoutMillis));
+
+    // An old-name sidecar (v1) left behind without its package.
+    QJsonObject json = sidecarJson(1, 1, crateRefs({"crate_a"}));
+    json["file"] = QStringLiteral("Old Name [10000001].stem.mp4");
+    ASSERT_TRUE(writeByRename(tracksPath(QStringLiteral("Old Name [10000001].djlib.json")),
+            QJsonDocument(json).toJson()));
+    m_pService->requestPass();
+    QTest::qWait(300);
+    ASSERT_TRUE(waitIdle());
+    EXPECT_EQ(0, m_pService->status().waitingForPackage);
+    EXPECT_FALSE(m_pService->store().trackState(djlibId(1))->pendingJson);
 }

@@ -57,4 +57,5 @@ class DjlibCrateSync : public QObject {
 
     TrackCollection* const m_pTrackCollection;
     DjlibStore* const m_pStore;
+    CrateId m_deletingOwnCrate; // valid while reconcile() deletes a crate
 };

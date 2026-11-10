@@ -204,6 +204,52 @@ QList<DjlibStore::TrackState> DjlibStore::selectTrackStates(
     return result;
 }
 
+QList<DjlibStore::TrackFile> DjlibStore::trackFiles() const {
+    QList<TrackFile> result;
+    QSqlQuery query(m_database);
+    if (!prepareOrLog(query,
+                QStringLiteral("SELECT djlib_id, track_id, file, sidecar_version "
+                               "FROM djlib_tracks")) ||
+            !execOrLog(query)) {
+        return result;
+    }
+    while (query.next()) {
+        TrackFile entry;
+        entry.djlibId = query.value(0).toString();
+        if (!query.value(1).isNull()) {
+            entry.trackId = TrackId(query.value(1));
+        }
+        entry.file = query.value(2).toString();
+        entry.sidecarVersion = query.value(3).toLongLong();
+        result.append(std::move(entry));
+    }
+    return result;
+}
+
+bool DjlibStore::setSidecarVersion(const QString& djlibId, qint64 sidecarVersion) {
+    QSqlQuery query(m_database);
+    if (!prepareOrLog(query,
+                QStringLiteral("UPDATE djlib_tracks SET sidecar_version = :version, "
+                               "updated_at = :now WHERE djlib_id = :id"))) {
+        return false;
+    }
+    query.bindValue(QStringLiteral(":version"), sidecarVersion);
+    query.bindValue(QStringLiteral(":now"), QDateTime::currentMSecsSinceEpoch());
+    query.bindValue(QStringLiteral(":id"), djlibId);
+    return execOrLog(query);
+}
+
+int DjlibStore::countPending() const {
+    QSqlQuery query(m_database);
+    if (!prepareOrLog(query,
+                QStringLiteral("SELECT COUNT(*) FROM djlib_tracks "
+                               "WHERE pending_json IS NOT NULL")) ||
+            !execOrLog(query) || !query.next()) {
+        return 0;
+    }
+    return query.value(0).toInt();
+}
+
 QList<DjlibStore::TrackState> DjlibStore::trackStates() const {
     return selectTrackStates(QString(), QVariant());
 }

@@ -36,11 +36,6 @@ class Keys final {
     // Return key text form the track metadata literally (not normalized)
     QString getGlobalKeyText() const;
 
-    // Where the global key came from (analyzer, file metadata or user).
-    mixxx::track::io::key::Source getSource() const {
-        return m_keyMap.source();
-    }
-
   private:
     explicit Keys(const mixxx::track::io::key::KeyMap& m_keyMap);
 

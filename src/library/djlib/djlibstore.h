@@ -56,11 +56,26 @@ class DjlibStore {
     bool removeCrateMapping(const QString& djlibId);
     bool removeCrateMappingByCrateId(CrateId crateId);
 
+    /// The columns the removal sweep needs (no fingerprints/JSON).
+    struct TrackFile {
+        QString djlibId;
+        TrackId trackId;
+        QString file;
+        qint64 sidecarVersion = 0;
+    };
+
     // Tracks
     QList<TrackState> trackStates() const;
+    QList<TrackFile> trackFiles() const;
+    bool setSidecarVersion(const QString& djlibId, qint64 sidecarVersion);
+    /// Rows with a sidecar waiting for its package.
+    int countPending() const;
     std::optional<TrackState> trackState(const QString& djlibId) const;
     std::optional<TrackState> trackStateByTrackId(TrackId trackId) const;
-    /// Inserts or replaces the whole row; sets `updated_at`.
+    /// Inserts or replaces the whole row; sets `updated_at`. NOTE: track_id
+    /// is UNIQUE, so a row of another djlib id on the same track_id is
+    /// replaced (dropped) - relocation keeps the djlib id, so it can't happen
+    /// there.
     bool upsertTrackState(const TrackState& state);
     /// Sets or clears (std::nullopt) `pending_json` of an existing row.
     bool setPendingJson(const QString& djlibId, const std::optional<QByteArray>& json);

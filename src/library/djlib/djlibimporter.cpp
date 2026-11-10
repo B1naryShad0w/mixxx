@@ -13,11 +13,13 @@
 #include "library/djlib/djlibstore.h"
 #include "proto/keys.pb.h"
 #include "track/cue.h"
+#include "track/keyfactory.h"
 #include "track/keys.h"
 #include "track/keyutils.h"
 #include "track/replaygain.h"
 #include "track/track.h"
 #include "util/assert.h"
+#include "util/defs.h"
 #include "util/logger.h"
 #include "util/math.h"
 
@@ -85,6 +87,17 @@ bool isHotCue(const CuePointer& pCue) {
             pCue->getHotCue() != Cue::kNoHotCue;
 }
 
+/// Keys has no source accessor (core header kept unchanged): read it from
+/// the serialized KeyMap.
+mixxx::track::io::key::Source keySource(const Keys& keys) {
+    const QByteArray bytes = keys.toByteArray();
+    mixxx::track::io::key::KeyMap keyMap;
+    if (!keyMap.ParseFromArray(bytes.constData(), static_cast<int>(bytes.size()))) {
+        return mixxx::track::io::key::ANALYZER;
+    }
+    return keyMap.source();
+}
+
 bool hasHotCues(const Track& track) {
     const auto cues = track.getCuePoints();
     return std::any_of(cues.cbegin(), cues.cend(), isHotCue);
@@ -145,6 +158,9 @@ void applyCues(Track* pTrack,
         case DjlibSidecar::Cue::Type::HotCue: {
             // Sidecar numbers are 1-based, Mixxx hot cue indices 0-based.
             const int index = mixxx::kFirstHotCueIndex + cue.number - 1;
+            if (index >= mixxx::kFirstHotCueIndex + kMaxNumberOfHotcues) {
+                break; // beyond Mixxx's hot cues
+            }
             if (hotCueIndices.contains(index)) {
                 break; // duplicate number: the first one wins
             }
@@ -183,6 +199,7 @@ void applyCues(Track* pTrack,
 } // namespace
 
 const QString DjlibImporter::kBeatsSubVersion = QStringLiteral("djlib/1");
+const QString DjlibImporter::kKeySubVersion = QStringLiteral("djlib/1");
 
 DjlibImporter::DjlibImporter(DjlibCrateSync* pCrateSync)
         : m_pCrateSync(pCrateSync) {
@@ -344,7 +361,7 @@ DjlibImporter::ApplyResult DjlibImporter::apply(const TrackPointer& pTrack,
         const bool edited = state.appliedKey
                 ? static_cast<int>(currentKey) != *state.appliedKey
                 : (currentKey != mixxx::track::io::key::INVALID &&
-                          pTrack->getKeys().getSource() == mixxx::track::io::key::USER);
+                          keySource(pTrack->getKeys()) == mixxx::track::io::key::USER);
         if (newKey == mixxx::track::io::key::INVALID) {
             kLogger.warning() << "Unparsable key" << *sidecar.key << "for" << sidecar.trackId;
             result.key = Field::Failed;
@@ -353,7 +370,10 @@ DjlibImporter::ApplyResult DjlibImporter::apply(const TrackPointer& pTrack,
         } else if (edited) {
             result.key = Field::KeptDjEdit;
         } else {
-            pTrack->setKey(newKey, mixxx::track::io::key::FILE_METADATA);
+            // Tagged so the AnalyzerKey guard leaves exactly these keys alone.
+            Keys keys = KeyFactory::makeBasicKeys(newKey, mixxx::track::io::key::FILE_METADATA);
+            keys.setSubVersion(kKeySubVersion);
+            pTrack->setKeys(keys);
             result.key = Field::Applied;
             state.appliedKey = static_cast<int>(newKey);
         }

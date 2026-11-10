@@ -210,7 +210,13 @@ TEST_F(DjlibImporterTest, key) {
     const auto result = apply(sidecarJson(3));
     EXPECT_EQ(Field::Applied, result.key);
     EXPECT_EQ(key::A_MINOR, m_pTrack->getKey());
-    EXPECT_EQ(key::FILE_METADATA, m_pTrack->getKeys().getSource());
+    EXPECT_EQ(DjlibImporter::kKeySubVersion, m_pTrack->getKeys().getSubVersion());
+    {
+        const QByteArray bytes = m_pTrack->getKeys().toByteArray();
+        key::KeyMap keyMap;
+        ASSERT_TRUE(keyMap.ParseFromArray(bytes.constData(), static_cast<int>(bytes.size())));
+        EXPECT_EQ(key::FILE_METADATA, keyMap.source());
+    }
     EXPECT_EQ(std::optional<int>(key::A_MINOR), m_store.trackState(kDjlibId)->appliedKey);
 }
 
@@ -486,10 +492,31 @@ class DjlibAnalyzerKeyGuardTest : public DjlibImporterTest {
     }
 };
 
-TEST_F(DjlibAnalyzerKeyGuardTest, fileMetadataKeyIsNotReanalyzed) {
+TEST_F(DjlibAnalyzerKeyGuardTest, djlibKeyIsNotReanalyzed) {
+    apply(sidecarJson(1));
+    EXPECT_EQ(DjlibImporter::kKeySubVersion, m_pTrack->getKeys().getSubVersion());
+    EXPECT_FALSE(keyAnalyzerWouldRun());
+
+    // The tag survives a save and reload.
+    trackCollectionManager()->saveTrack(m_pTrack);
+    m_pTrack.reset();
+    m_pTrack = getOrAddTrackByLocation(m_tempDir.filePath(kTrackFile));
+    ASSERT_TRUE(m_pTrack);
+    EXPECT_EQ(DjlibImporter::kKeySubVersion, m_pTrack->getKeys().getSubVersion());
+    EXPECT_FALSE(keyAnalyzerWouldRun());
+}
+
+TEST_F(DjlibAnalyzerKeyGuardTest, otherKeysBehaveAsUpstream) {
+    // An outdated analyzer key and an ordinary file-tag key are re-analysed
+    // with ReanalyzeWhenSettingsChange, as in stock Mixxx.
     m_pTrack->setKey(key::A_MINOR, key::ANALYZER);
-    // Control: an outdated analyzer key is re-analysed with this setting.
     EXPECT_TRUE(keyAnalyzerWouldRun());
     m_pTrack->setKey(key::A_MINOR, key::FILE_METADATA);
-    EXPECT_FALSE(keyAnalyzerWouldRun());
+    EXPECT_TRUE(keyAnalyzerWouldRun());
+}
+
+TEST_F(DjlibImporterTest, userKeyWithoutFingerprintIsKept) {
+    m_pTrack->setKey(key::C_MAJOR, key::USER);
+    EXPECT_EQ(Field::KeptDjEdit, apply(sidecarJson(1)).key);
+    EXPECT_EQ(key::C_MAJOR, m_pTrack->getKey());
 }
