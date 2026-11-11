@@ -1150,14 +1150,58 @@ void DjlibService::relocateIfMoved(TrackId trackId, const QString& newPath) {
     if (oldStillThere) {
         return;
     }
-    if (m_pTrackCollectionManager->getTrackByRef(TrackRef::fromFileInfo(newFileInfo))) {
-        return; // the new file already is a library track
+    // The new file may already be a library track: the package was listed
+    // (and added) before its sidecar arrived. A row nobody has used yet is
+    // dropped in favour of the old one; else the new track takes over.
+    if (!dropUnusedDuplicate(trackId, newFileInfo)) {
+        return;
     }
     // Renamed by the agent (title fix) or library folder moved: keep the
     // row with all DJ edits, cues and history.
     if (!m_pTrackCollectionManager->relocateTrack(trackId, newFileInfo)) {
         kLogger.warning() << "Cannot relocate" << oldLocation << "->" << newPath;
     }
+}
+
+bool DjlibService::dropUnusedDuplicate(TrackId keptTrackId, const mixxx::FileInfo& fileInfo) {
+    TrackId duplicateId;
+    {
+        const TrackPointer pDuplicate =
+                m_pTrackCollectionManager->getTrackByRef(TrackRef::fromFileInfo(fileInfo));
+        if (!pDuplicate) {
+            return true; // no row in the way
+        }
+        duplicateId = pDuplicate->getId();
+        if (!duplicateId.isValid() || duplicateId == keptTrackId) {
+            return false;
+        }
+        const auto cues = pDuplicate->getCuePoints();
+        const bool hasHotCues = std::any_of(cues.cbegin(), cues.cend(), [](const CuePointer& pCue) {
+            return pCue && pCue->getType() == mixxx::CueType::HotCue;
+        });
+        if (isTrackLoaded(pDuplicate) || pDuplicate->getTimesPlayed() > 0 ||
+                hasHotCues || m_store.trackStateByTrackId(duplicateId)) {
+            return false;
+        }
+    }
+    TrackCollection* const pCollection = m_pTrackCollectionManager->internalCollection();
+    QSet<int> playlists;
+    pCollection->getPlaylistDAO().getPlaylistsTrackIsIn(duplicateId, &playlists);
+    if (!playlists.isEmpty() ||
+            !pCollection->crates().collectCrateIdsOfTracks({duplicateId}).isEmpty()) {
+        return false;
+    }
+    kLogger.info() << "Dropping the unused library entry of" << fileInfo.location()
+                   << "- the renamed track keeps its entry";
+    m_pTrackCollectionManager->purgeTracks({TrackRef::fromFileInfo(fileInfo, duplicateId)});
+    if (m_pTrackCollectionManager->getTrackById(duplicateId)) {
+        return false; // not purged
+    }
+    m_probed.remove(duplicateId);
+    for (auto it = m_deferred.begin(); it != m_deferred.end();) {
+        it = it->trackId == duplicateId ? m_deferred.erase(it) : ++it;
+    }
+    return true;
 }
 
 void DjlibService::applyMembership(const QString& djlibId, const QStringList& crateIds) {

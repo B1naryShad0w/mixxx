@@ -848,6 +848,94 @@ TEST_F(DjlibServiceTest, renameWhileClosedRelocatesAndKeepsDjEdits) {
     EXPECT_EQ(trackId, m_pService->store().trackState(djlibId(1))->trackId);
 }
 
+TEST_F(DjlibServiceTest, renameSeenPackageFirstKeepsTheLibraryEntry) {
+    writeCrates({"crate_a"});
+    startService();
+    writePackage(1);
+    writeSidecar(1, 1, {"crate_a"});
+    ASSERT_TRUE(QTest::qWaitFor([this] { return hasDjlibBeats(1); }, kTimeoutMillis));
+    TrackId trackId;
+    {
+        const auto pTrack = track(1);
+        trackId = pTrack->getId();
+        addDjHotCue(pTrack);
+        trackCollectionManager()->saveTrack(pTrack);
+    }
+    ASSERT_TRUE(waitIdle());
+
+    // Title fix while Mixxx runs, and a pass falls between the package and
+    // its sidecar: the new name becomes a library track of its own first.
+    const QString newName = QStringLiteral("Artist - Better Title [10000001].stem.mp4");
+    ASSERT_TRUE(QFile::rename(tracksPath(packageName(1)), tracksPath(newName)));
+    ASSERT_TRUE(QFile::remove(tracksPath(sidecarName(1))));
+    ASSERT_TRUE(QTest::qWaitFor(
+            [this, newName] { return trackByPath(tracksPath(newName)) != nullptr; },
+            kTimeoutMillis));
+    ASSERT_TRUE(waitIdle());
+    ASSERT_NE(trackId, trackByPath(tracksPath(newName))->getId());
+
+    QJsonObject json = sidecarJson(1, 2, crateRefs({"crate_a"}));
+    json["file"] = newName;
+    ASSERT_TRUE(writeByRename(
+            tracksPath(QStringLiteral("Artist - Better Title [10000001].djlib.json")),
+            QJsonDocument(json).toJson()));
+    ASSERT_TRUE(QTest::qWaitFor(
+            [this] {
+                const auto state = m_pService->store().trackState(djlibId(1));
+                return state && state->sidecarVersion == 2;
+            },
+            kTimeoutMillis));
+    ASSERT_TRUE(waitIdle());
+    const auto pTrack = trackByPath(tracksPath(newName));
+    ASSERT_TRUE(pTrack);
+    EXPECT_EQ(trackId, pTrack->getId()); // the old row, not the stand-in
+    EXPECT_TRUE(hasDjHotCue(pTrack));
+    EXPECT_EQ(QStringList{"crate_a"}, managedCratesOf(trackId));
+    EXPECT_EQ(trackId, m_pService->store().trackState(djlibId(1))->trackId);
+}
+
+TEST_F(DjlibServiceTest, renameOntoAUsedLibraryEntryLetsItTakeOver) {
+    writeCrates({"crate_a"});
+    startService();
+    writePackage(1);
+    writeSidecar(1, 1, {"crate_a"});
+    ASSERT_TRUE(QTest::qWaitFor([this] { return hasDjlibBeats(1); }, kTimeoutMillis));
+    const TrackId trackId = track(1)->getId();
+    ASSERT_TRUE(waitIdle());
+
+    const QString newName = QStringLiteral("Artist - Better Title [10000001].stem.mp4");
+    ASSERT_TRUE(QFile::rename(tracksPath(packageName(1)), tracksPath(newName)));
+    ASSERT_TRUE(QFile::remove(tracksPath(sidecarName(1))));
+    ASSERT_TRUE(QTest::qWaitFor(
+            [this, newName] { return trackByPath(tracksPath(newName)) != nullptr; },
+            kTimeoutMillis));
+    ASSERT_TRUE(waitIdle());
+    TrackId newTrackId;
+    {
+        // The DJ already worked with the new entry: it must not be dropped.
+        const auto pTrack = trackByPath(tracksPath(newName));
+        newTrackId = pTrack->getId();
+        addDjHotCue(pTrack);
+        trackCollectionManager()->saveTrack(pTrack);
+    }
+    QJsonObject json = sidecarJson(1, 2, crateRefs({"crate_a"}));
+    json["file"] = newName;
+    ASSERT_TRUE(writeByRename(
+            tracksPath(QStringLiteral("Artist - Better Title [10000001].djlib.json")),
+            QJsonDocument(json).toJson()));
+    ASSERT_TRUE(QTest::qWaitFor(
+            [this, newTrackId] {
+                const auto state = m_pService->store().trackState(djlibId(1));
+                return state && state->trackId == newTrackId;
+            },
+            kTimeoutMillis));
+    ASSERT_TRUE(waitIdle());
+    EXPECT_TRUE(hasDjHotCue(trackCollectionManager()->getTrackById(newTrackId)));
+    EXPECT_TRUE(trackCollectionManager()->getTrackById(trackId));
+    EXPECT_EQ(QStringList{"crate_a"}, managedCratesOf(newTrackId));
+    EXPECT_TRUE(managedCratesOf(trackId).isEmpty());
+}
+
 TEST_F(DjlibServiceTest, libraryFolderMoveRelocatesTracks) {
     writeCrates({"crate_a"});
     startService();

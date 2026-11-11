@@ -26,6 +26,10 @@
 
 class TrackCollectionManager;
 
+namespace mixxx {
+class FileInfo;
+}
+
 namespace djlib {
 
 /// Size and modification time of a watched file (the snapshot diff key).
@@ -276,6 +280,8 @@ class DjlibService : public QObject {
     void reconcile(const QList<djlib::CrateRef>& crates, bool membershipsIncluded);
     void sweepMissingPackages();
     void relocateIfMoved(TrackId trackId, const QString& newPath);
+    /// True if no library row (any more) is at `fileInfo`.
+    bool dropUnusedDuplicate(TrackId keptTrackId, const mixxx::FileInfo& fileInfo);
     bool packageAdded(const QString& packageName);
     bool sidecarChanged(const djlib::ParsedSidecar& parsed);
     void applyMembership(const QString& djlibId, const QStringList& crateIds);
