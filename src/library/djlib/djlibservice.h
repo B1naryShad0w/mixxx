@@ -70,6 +70,20 @@ void setReadFailureForTesting(std::function<bool(const QString& path)> fn);
 /// or "add" (a new library track). Called on the main thread.
 void setWriteFailureForTesting(std::function<bool(const QString& what)> fn);
 
+/// What the agent's `library.json` says: the agent writes
+/// `{"schema":1,"library_dir":"<absolute path>"}` into its state folder on
+/// every start and whenever its library folder changes.
+struct AgentLibrary {
+    enum class State {
+        Absent,  // no such file: no agent here (yet)
+        Invalid, // unreadable, too large, other schema, no absolute path
+        Found,
+    };
+    State state = State::Absent;
+    QString libraryDir; // cleaned; only with Found
+};
+AgentLibrary readAgentLibraryFile(const QString& path);
+
 /// A sidecar read and parsed on a worker thread.
 struct ParsedSidecar {
     QString sidecarName; // file name in <lib>/tracks
@@ -150,7 +164,12 @@ struct PassResult {
 ///   track: the old one leaves the managed crates and the djlib state starts
 ///   fresh (old fingerprints would read as DJ edits).
 ///
-/// Settings: `[djlib] LibraryPath` (empty = disabled). Main thread only.
+/// Settings: `[djlib] LibraryPath`. A folder chosen there always wins. Empty
+/// or absent = automatic: the folder the agent names in its `library.json`,
+/// else `<Music>/djlib` if that exists, else off. It is looked up on a worker
+/// thread at start and again with every safety pass, so a library that
+/// appears or moves later is picked up without a restart. A folder found
+/// that way is never written to the settings. Main thread only.
 class DjlibService : public QObject {
     Q_OBJECT
   public:
@@ -158,6 +177,7 @@ class DjlibService : public QObject {
 
     struct Status {
         QString libraryPath; // empty: disabled
+        bool automatic = false; // not chosen in the preferences
         bool watching = false;
         QDateTime lastImport; // invalid: none since start
         QString lastImportFile;
@@ -182,9 +202,13 @@ class DjlibService : public QObject {
     static DjlibService* instance();
 
     /// `<musicDir>/djlib` (the agent's default library) if it exists, else
-    /// empty. Used when `[djlib] LibraryPath` is absent (first run).
+    /// empty. Used in automatic mode when the agent left no `library.json`.
     static QString defaultLibraryPath(const QString& musicDir);
     static QString defaultLibraryPath();
+    /// `<agent state dir>/library.json`. The state dir as the agent picks
+    /// it: `%LOCALAPPDATA%\djlib-agent`, else `$XDG_STATE_HOME/djlib-agent`,
+    /// else `~/.local/state/djlib-agent`.
+    static QString agentLibraryFile();
     /// Cleans a chosen path; a picked `.../tracks` folder next to `_djlib`
     /// becomes its parent (the library folder).
     static QString normalizeLibraryPath(const QString& path);
@@ -193,14 +217,24 @@ class DjlibService : public QObject {
     /// Wired to `PlayerInfo::isTrackLoaded` in CoreServices.
     void setTrackLoadedFn(TrackLoadedFn fn);
 
-    /// Reads `[djlib] LibraryPath` and (re)starts watching. If the setting is
-    /// absent, uses (and stores) `defaultLibraryPath()` when that exists.
+    /// Where automatic mode looks (default: `agentLibraryFile()` and the
+    /// user's Music folder). Call before `start()`; tests point it at
+    /// temporary folders.
+    void setDiscoveryPaths(const QString& agentLibraryFile, const QString& musicDir);
+
+    /// Reads `[djlib] LibraryPath` and (re)starts watching; without a folder
+    /// there, starts looking for the agent's library.
     void start();
 
-    /// Stores the path in the settings and re-arms the watcher.
+    /// Stores the path in the settings and re-arms the watcher. Empty:
+    /// back to automatic.
     void setLibraryPath(const QString& libraryPath);
     QString libraryPath() const {
         return m_libraryPath;
+    }
+    /// True if no folder is chosen in the settings.
+    bool isAutomaticPath() const {
+        return m_automatic;
     }
 
     Status status() const;
@@ -267,6 +301,8 @@ class DjlibService : public QObject {
     void startPass();
     void onPassFinished(djlib::PassResult result);
     void startMembershipJob(const QSet<QString>& crateIds);
+    void startDiscovery();
+    void usePath(const QString& configuredPath, bool force);
     void startProbe(const TrackPointer& pTrack);
     void reprobeDeferred();
 
@@ -333,6 +369,12 @@ class DjlibService : public QObject {
     int m_retryDelayMillis = 0;
     int m_writeRetryDelayMillis = 0;
     bool m_scanRunning = false; // library scan: no library writes meanwhile
+    bool m_automatic = false;   // m_libraryPath is discovered, not configured
+    bool m_discovering = false;
+    quint64 m_discoveryEpoch = 0; // older lookups are discarded
+    QString m_agentLibraryFile;
+    QString m_musicDir;
+    QTimer m_discoveryTimer;
     bool m_sweepNeeded = false; // first pass after rearm, or names were lost
     QElapsedTimer m_emptySince; // tracks/ listed empty while rows are mapped
     QElapsedTimer m_cratesEmptySince; // crates.json empty while crates are managed

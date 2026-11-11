@@ -33,7 +33,7 @@
       <item row="0" column="1">
        <widget class="QLineEdit" name="lineEditLibraryPath">
         <property name="placeholderText">
-         <string>Not set: djlib sync is off</string>
+         <string>Automatic: the djlib agent's library folder</string>
         </property>
        </widget>
       </item>
@@ -47,7 +47,7 @@
       <item row="1" column="0" colspan="3">
        <widget class="QLabel" name="labelFolderHelp">
         <property name="text">
-         <string>Choose the djlib library folder: the folder the djlib agent syncs to, which contains "tracks" and "_djlib" (by default "djlib" in your Music folder). New and changed tracks are imported while Mixxx runs. Leave empty to turn djlib sync off.</string>
+         <string>Choose the djlib library folder: the folder the djlib agent syncs to, which contains "tracks" and "_djlib" (by default "djlib" in your Music folder). New and changed tracks are imported while Mixxx runs. Leave empty to let Mixxx find the folder of the djlib agent on this computer by itself, also when it is set up or moved later.</string>
         </property>
         <property name="wordWrap">
          <bool>true</bool>

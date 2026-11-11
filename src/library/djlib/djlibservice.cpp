@@ -4,6 +4,8 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QRegularExpression>
 #include <QSqlQuery>
 #include <QStandardPaths>
@@ -47,6 +49,9 @@ std::function<bool(const QString&)> s_writeFailureForTesting;
 /// A queue item that failed (track not added, row not written) is tried
 /// this often before it waits for the next change of its file.
 constexpr int kMaxItemAttempts = 10;
+
+/// The agent's library.json is a few hundred bytes.
+constexpr qint64 kMaxAgentLibraryBytes = 64 * 1024;
 
 /// A package whose sample rate can't be read (still being written, locked
 /// by a scanner) is opened again with the safety passes, this often at most
@@ -393,6 +398,10 @@ DjlibService::DjlibService(UserSettingsPointer pConfig,
     m_probePool.setMaxThreadCount(1);
     m_retryTimer.setSingleShot(true);
     connect(&m_retryTimer, &QTimer::timeout, this, &DjlibService::requestPass);
+    m_agentLibraryFile = agentLibraryFile();
+    m_musicDir = QStandardPaths::writableLocation(QStandardPaths::MusicLocation);
+    m_discoveryTimer.setInterval(m_timing.safetyPassMillis);
+    connect(&m_discoveryTimer, &QTimer::timeout, this, &DjlibService::startDiscovery);
     m_writeRetryTimer.setSingleShot(true);
     connect(&m_writeRetryTimer, &QTimer::timeout, this, &DjlibService::slotWriteRetry);
     // The library scanner writes the database from its own thread and keeps
@@ -477,6 +486,35 @@ DjlibService::~DjlibService() {
     m_probePool.waitForDone();
 }
 
+djlib::AgentLibrary djlib::readAgentLibraryFile(const QString& path) {
+    AgentLibrary result;
+    QFile file(path);
+    if (!file.exists()) {
+        return result;
+    }
+    result.state = AgentLibrary::State::Invalid;
+    if (!file.open(QIODevice::ReadOnly)) {
+        return result;
+    }
+    const QByteArray json = file.read(kMaxAgentLibraryBytes + 1);
+    if (json.size() > kMaxAgentLibraryBytes) {
+        return result;
+    }
+    const QJsonObject object = QJsonDocument::fromJson(json).object();
+    const QJsonValue schema = object.value(QLatin1String("schema"));
+    const QJsonValue libraryDir = object.value(QLatin1String("library_dir"));
+    if (!schema.isDouble() || schema.toDouble() != 1 || !libraryDir.isString()) {
+        return result;
+    }
+    const QString dir = QDir::fromNativeSeparators(libraryDir.toString().trimmed());
+    if (dir.isEmpty() || !QDir::isAbsolutePath(dir)) {
+        return result;
+    }
+    result.libraryDir = QDir::cleanPath(dir);
+    result.state = AgentLibrary::State::Found;
+    return result;
+}
+
 void djlib::setReadFailureForTesting(std::function<bool(const QString& path)> fn) {
     s_readFailureForTesting = std::move(fn);
 }
@@ -510,6 +548,73 @@ QString DjlibService::defaultLibraryPath() {
 }
 
 // static
+QString DjlibService::agentLibraryFile() {
+    // As defaultStateDir() of the agent (cmd/djlib-agent/main.go).
+    QString dir = QDir::fromNativeSeparators(qEnvironmentVariable("LOCALAPPDATA"));
+    if (dir.isEmpty()) {
+        dir = qEnvironmentVariable("XDG_STATE_HOME");
+    }
+    if (dir.isEmpty()) {
+        dir = QDir::home().filePath(QStringLiteral(".local/state"));
+    }
+    return QDir(dir).filePath(QStringLiteral("djlib-agent/library.json"));
+}
+
+void DjlibService::setDiscoveryPaths(const QString& agentLibraryFile, const QString& musicDir) {
+    m_agentLibraryFile = agentLibraryFile;
+    m_musicDir = musicDir;
+}
+
+void DjlibService::startDiscovery() {
+    if (!m_automatic || m_discovering) {
+        return;
+    }
+    m_discovering = true;
+    ++m_jobsRunning;
+    struct Found {
+        djlib::AgentLibrary agent;
+        QString defaultPath;
+    };
+    QtConcurrent::run(&m_pool,
+            [agentLibraryFile = m_agentLibraryFile, musicDir = m_musicDir] {
+                Found found;
+                try {
+                    found.agent = djlib::readAgentLibraryFile(agentLibraryFile);
+                    if (found.agent.state != djlib::AgentLibrary::State::Found) {
+                        found.defaultPath = defaultLibraryPath(musicDir);
+                    }
+                } catch (...) {
+                    found.agent.state = djlib::AgentLibrary::State::Invalid;
+                }
+                return found;
+            })
+            .then(this, [this, epoch = m_discoveryEpoch](const Found& found) {
+                --m_jobsRunning;
+                m_discovering = false;
+                if (epoch != m_discoveryEpoch) {
+                    startDiscovery(); // the setting changed meanwhile
+                    checkIdle();
+                    return;
+                }
+                // The agent's word counts. Without it (no agent yet, or its
+                // file can't be read right now) a folder already in use
+                // stays; else the agent's default folder if it is there.
+                QString path = m_libraryPath;
+                if (found.agent.state == djlib::AgentLibrary::State::Found) {
+                    path = found.agent.libraryDir;
+                } else if (path.isEmpty()) {
+                    path = found.defaultPath;
+                }
+                if (path != m_libraryPath) {
+                    kLogger.info() << "djlib library found:" << path;
+                    m_libraryPath = path;
+                    rearm();
+                }
+                checkIdle();
+            });
+}
+
+// static
 QString DjlibService::normalizeLibraryPath(const QString& path) {
     const QString trimmed = path.trimmed();
     if (trimmed.isEmpty()) {
@@ -528,26 +633,39 @@ QString DjlibService::normalizeLibraryPath(const QString& path) {
 }
 
 void DjlibService::start() {
-    if (m_pConfig->exists(kLibraryPathKey)) {
-        m_libraryPath = normalizeLibraryPath(m_pConfig->getValueString(kLibraryPathKey));
-    } else {
-        // First run: the agent's default folder, if it is there.
-        m_libraryPath = defaultLibraryPath();
-        if (!m_libraryPath.isEmpty()) {
-            kLogger.info() << "Using the default djlib library" << m_libraryPath;
-            m_pConfig->setValue(kLibraryPathKey, m_libraryPath);
-        }
-    }
-    rearm();
+    usePath(normalizeLibraryPath(m_pConfig->getValueString(kLibraryPathKey)), true);
 }
 
 void DjlibService::setLibraryPath(const QString& libraryPath) {
     const QString path = normalizeLibraryPath(libraryPath);
     m_pConfig->setValue(kLibraryPathKey, path);
-    if (path == m_libraryPath && (path.isEmpty() || m_safetyTimer.isActive())) {
+    usePath(path, false);
+}
+
+void DjlibService::usePath(const QString& configuredPath, bool force) {
+    const bool automatic = configuredPath.isEmpty();
+    if (automatic) {
+        // Not chosen: where the agent says its library is, looked up now
+        // and again with every safety pass.
+        if (!m_automatic || force) {
+            m_automatic = true;
+            ++m_discoveryEpoch;
+            m_libraryPath.clear();
+            rearm();
+            m_discoveryTimer.start();
+        }
+        startDiscovery();
         return;
     }
-    m_libraryPath = path;
+    const bool unchanged = !m_automatic && configuredPath == m_libraryPath &&
+            m_safetyTimer.isActive();
+    m_automatic = false;
+    ++m_discoveryEpoch;
+    m_discoveryTimer.stop();
+    if (unchanged && !force) {
+        return;
+    }
+    m_libraryPath = configuredPath;
     rearm();
 }
 
@@ -1374,6 +1492,7 @@ void DjlibService::slotDeckTrackChanged(const QString& group,
 DjlibService::Status DjlibService::status() const {
     Status status;
     status.libraryPath = m_libraryPath;
+    status.automatic = m_automatic;
     status.watching = !m_libraryPath.isEmpty() && !m_watcher.directories().isEmpty();
     status.lastImport = m_lastImport;
     status.lastImportFile = m_lastImportFile;

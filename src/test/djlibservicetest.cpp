@@ -131,7 +131,7 @@ class DjlibServiceTest : public LibraryTest {
         DjlibService::Timing timing;
         timing.debounceMillis = 100;
         timing.maxDelayMillis = 500;
-        timing.safetyPassMillis = 60000;
+        timing.safetyPassMillis = m_safetyPassMillis;
         timing.retryMinMillis = 50;
         timing.retryMaxMillis = 400;
         timing.emptyConfirmMillis = m_emptyConfirmMillis;
@@ -140,6 +140,23 @@ class DjlibServiceTest : public LibraryTest {
         m_pService->setTrackLoadedFn([this](const TrackPointer& pTrack) {
             return pTrack && m_loaded.contains(pTrack->getId());
         });
+        // Never the real agent or Music folder of the machine running this.
+        m_pService->setDiscoveryPaths(agentFilePath(), musicPath());
+    }
+
+    QString agentFilePath() const {
+        return QDir(m_homeDir.path()).filePath(QStringLiteral("state/djlib-agent/library.json"));
+    }
+
+    QString musicPath() const {
+        return QDir(m_homeDir.path()).filePath(QStringLiteral("Music"));
+    }
+
+    /// As the agent does on every start and library change.
+    void writeAgentFile(const QString& libraryDir) {
+        ASSERT_TRUE(QDir().mkpath(QFileInfo(agentFilePath()).absolutePath()));
+        const QJsonObject json{{"schema", 1}, {"library_dir", libraryDir}};
+        ASSERT_TRUE(writeByRename(agentFilePath(), QJsonDocument(json).toJson()));
     }
 
     void startService() {
@@ -220,6 +237,8 @@ class DjlibServiceTest : public LibraryTest {
 
     QTemporaryDir m_libDir;
     QString m_libPath = m_libDir.path();
+    QTemporaryDir m_homeDir; // agent state folder and Music folder
+    int m_safetyPassMillis = 60000;
     QSet<TrackId> m_loaded;
     int m_emptyConfirmMillis = 300;
     std::unique_ptr<DjlibService> m_pService;
@@ -1177,20 +1196,182 @@ TEST_F(DjlibServiceTest, libraryPathLogic) {
     EXPECT_EQ(QString(), DjlibService::normalizeLibraryPath(QStringLiteral("  ")));
 }
 
-TEST_F(DjlibServiceTest, absentSettingUsesDefaultEmptySettingStaysOff) {
-    // Absent: the default (if present) is used and stored. With no
-    // <music>/djlib on the test machine this stays off; an explicit empty
-    // setting always stays off.
+TEST_F(DjlibServiceTest, withoutSettingAndAgentItStaysOff) {
+    // Absent and empty setting are the same: automatic, nothing found.
     createService();
     m_pService->start();
-    EXPECT_EQ(DjlibService::defaultLibraryPath(), m_pService->libraryPath());
+    ASSERT_TRUE(waitIdle());
+    EXPECT_TRUE(m_pService->isAutomaticPath());
+    EXPECT_EQ(QString(), m_pService->libraryPath());
+    EXPECT_FALSE(m_pService->status().watching);
     stopService();
 
     config()->setValue(DjlibService::kLibraryPathKey, QString());
     createService();
     m_pService->start();
+    ASSERT_TRUE(waitIdle());
     EXPECT_EQ(QString(), m_pService->libraryPath());
     EXPECT_FALSE(m_pService->status().watching);
+}
+
+TEST_F(DjlibServiceTest, agentLibraryFileIsParsedStrictly) {
+    using State = djlib::AgentLibrary::State;
+    const QString path = agentFilePath();
+    EXPECT_EQ(State::Absent, djlib::readAgentLibraryFile(path).state);
+
+    writeAgentFile(m_libPath + QStringLiteral("/"));
+    const auto found = djlib::readAgentLibraryFile(path);
+    EXPECT_EQ(State::Found, found.state);
+    EXPECT_EQ(QDir::cleanPath(m_libPath), found.libraryDir);
+
+    const QList<QByteArray> invalid{
+            QByteArray(),
+            QByteArrayLiteral("{\"schema\":1,\"library_dir\":"),
+            QByteArrayLiteral("[]"),
+            QByteArrayLiteral("{\"schema\":2,\"library_dir\":\"/music/djlib\"}"),
+            QByteArrayLiteral("{\"schema\":\"1\",\"library_dir\":\"/music/djlib\"}"),
+            QByteArrayLiteral("{\"library_dir\":\"/music/djlib\"}"),
+            QByteArrayLiteral("{\"schema\":1}"),
+            QByteArrayLiteral("{\"schema\":1,\"library_dir\":42}"),
+            QByteArrayLiteral("{\"schema\":1,\"library_dir\":\"  \"}"),
+            QByteArrayLiteral("{\"schema\":1,\"library_dir\":\"Music/djlib\"}"),
+            QByteArrayLiteral("{\"schema\":1,\"library_dir\":\"/music/djlib\",\"x\":\"") +
+                    QByteArray(70000, 'x') + QByteArrayLiteral("\"}"),
+    };
+    for (const auto& json : invalid) {
+        ASSERT_TRUE(writeByRename(path, json));
+        EXPECT_EQ(State::Invalid, djlib::readAgentLibraryFile(path).state)
+                << json.left(80).toStdString();
+    }
+}
+
+TEST_F(DjlibServiceTest, agentLibraryIsUsedWhenNoFolderIsChosen) {
+    writeAgentFile(m_libPath);
+    writeCrates({"crate_a"});
+    writePackage(1);
+    writeSidecar(1, 1, {"crate_a"});
+    createService();
+    m_pService->start();
+    ASSERT_TRUE(QTest::qWaitFor([this] { return hasDjlibBeats(1); }, kTimeoutMillis));
+    ASSERT_TRUE(waitIdle());
+    EXPECT_TRUE(m_pService->isAutomaticPath());
+    EXPECT_TRUE(m_pService->status().automatic);
+    EXPECT_EQ(QDir::cleanPath(m_libPath), m_pService->libraryPath());
+    EXPECT_TRUE(m_pService->status().watching);
+    // Found, not chosen: the setting stays empty, so a later move is followed.
+    EXPECT_EQ(QString(), config()->getValueString(DjlibService::kLibraryPathKey));
+}
+
+TEST_F(DjlibServiceTest, agentLibraryAppearingOrMovingLaterIsPickedUp) {
+    m_safetyPassMillis = 300;
+    writeCrates({"crate_a"});
+    writePackage(1);
+    writeSidecar(1, 1, {"crate_a"});
+    createService();
+    m_pService->start();
+    ASSERT_TRUE(waitIdle());
+    ASSERT_EQ(QString(), m_pService->libraryPath());
+
+    // The agent is installed and run while Mixxx is open.
+    writeAgentFile(m_libPath);
+    ASSERT_TRUE(QTest::qWaitFor([this] { return hasDjlibBeats(1); }, kTimeoutMillis));
+    EXPECT_EQ(QDir::cleanPath(m_libPath), m_pService->libraryPath());
+
+    // A file that can't be used (half-written, other schema) changes nothing.
+    ASSERT_TRUE(writeByRename(agentFilePath(), QByteArrayLiteral("{\"schema\":1,")));
+    QTest::qWait(800);
+    EXPECT_EQ(QDir::cleanPath(m_libPath), m_pService->libraryPath());
+    EXPECT_TRUE(m_pService->status().watching);
+
+    // The DJ moves the library in the agent's settings.
+    QTemporaryDir newLib;
+    ASSERT_TRUE(newLib.isValid());
+    ASSERT_TRUE(QDir(newLib.path()).mkpath(QStringLiteral("tracks")));
+    ASSERT_TRUE(QDir(newLib.path()).mkpath(QStringLiteral("_djlib")));
+    writeAgentFile(newLib.path());
+    ASSERT_TRUE(QTest::qWaitFor(
+            [this, &newLib] {
+                return m_pService->libraryPath() == QDir::cleanPath(newLib.path()) &&
+                        m_pService->status().watching;
+            },
+            kTimeoutMillis));
+    EXPECT_EQ(QString(), config()->getValueString(DjlibService::kLibraryPathKey));
+    stopService(); // before newLib goes
+}
+
+TEST_F(DjlibServiceTest, chosenFolderWinsOverTheAgentLibrary) {
+    m_safetyPassMillis = 300;
+    QTemporaryDir agentLib;
+    ASSERT_TRUE(agentLib.isValid());
+    ASSERT_TRUE(QDir(agentLib.path()).mkpath(QStringLiteral("tracks")));
+    writeAgentFile(agentLib.path());
+    startServiceFromConfig(); // m_libPath is in the settings
+    QTest::qWait(800);        // several lookups would have run
+    ASSERT_TRUE(waitIdle());
+    EXPECT_FALSE(m_pService->isAutomaticPath());
+    EXPECT_EQ(m_libPath, m_pService->libraryPath());
+    EXPECT_EQ(m_libPath, config()->getValueString(DjlibService::kLibraryPathKey));
+
+    // Cleared in the preferences: automatic again, the agent's folder.
+    m_pService->setLibraryPath(QString());
+    ASSERT_TRUE(QTest::qWaitFor(
+            [this, &agentLib] {
+                return m_pService->libraryPath() == QDir::cleanPath(agentLib.path());
+            },
+            kTimeoutMillis));
+    EXPECT_TRUE(m_pService->isAutomaticPath());
+
+    // And chosen again while a lookup may be running.
+    m_pService->setLibraryPath(m_libPath);
+    QTest::qWait(800);
+    EXPECT_EQ(m_libPath, m_pService->libraryPath());
+    stopService();
+}
+
+TEST_F(DjlibServiceTest, musicFolderDefaultIsUsedWithoutAgentFile) {
+    m_safetyPassMillis = 300;
+    createService();
+    m_pService->start();
+    ASSERT_TRUE(waitIdle());
+    ASSERT_EQ(QString(), m_pService->libraryPath());
+
+    // <Music>/djlib appears later (first sync of an agent without the file).
+    const QString defaultLib = QDir(musicPath()).filePath(QStringLiteral("djlib"));
+    ASSERT_TRUE(QDir().mkpath(defaultLib + QStringLiteral("/tracks")));
+    ASSERT_TRUE(QTest::qWaitFor(
+            [this, &defaultLib] { return m_pService->libraryPath() == defaultLib; },
+            kTimeoutMillis));
+    EXPECT_EQ(QString(), config()->getValueString(DjlibService::kLibraryPathKey));
+
+    // The agent's file, once there, is the better source.
+    writeAgentFile(m_libPath);
+    ASSERT_TRUE(QTest::qWaitFor(
+            [this] { return m_pService->libraryPath() == QDir::cleanPath(m_libPath); },
+            kTimeoutMillis));
+}
+
+TEST_F(DjlibServiceTest, preferencesPageShowsAutomaticFolder) {
+    createService();
+    m_pService->start();
+    ASSERT_TRUE(waitIdle());
+    DlgPrefDjlib page(nullptr, config());
+    auto* pLineEdit = page.findChild<QLineEdit*>(QStringLiteral("lineEditLibraryPath"));
+    auto* pWatched = page.findChild<QLabel*>(QStringLiteral("labelWatched"));
+    ASSERT_TRUE(pLineEdit && pWatched);
+    EXPECT_TRUE(pWatched->text().startsWith(QStringLiteral("No djlib library found yet")))
+            << pWatched->text().toStdString();
+
+    writeAgentFile(m_libPath);
+    m_pService->setLibraryPath(QString()); // as Apply with an empty field: looks again
+    ASSERT_TRUE(QTest::qWaitFor(
+            [this] { return m_pService->status().watching; }, kTimeoutMillis));
+    ASSERT_TRUE(waitIdle());
+    page.slotUpdate();
+    EXPECT_EQ(QString(), pLineEdit->text()); // nothing chosen
+    EXPECT_TRUE(pWatched->text().contains(QStringLiteral("found automatically")))
+            << pWatched->text().toStdString();
+    EXPECT_TRUE(pWatched->text().contains(QDir::toNativeSeparators(m_libPath)))
+            << pWatched->text().toStdString();
 }
 
 TEST_F(DjlibServiceTest, statusShowsMissingTracksFolder) {

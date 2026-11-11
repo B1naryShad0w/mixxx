@@ -74,13 +74,20 @@ void DlgPrefDjlib::slotUpdateStatus() {
     }
     const DjlibService* pService = DjlibService::instance();
     if (!pService || pService->libraryPath().isEmpty()) {
-        m_pUi->labelWatched->setText(tr("Off (no folder chosen)"));
+        m_pUi->labelWatched->setText(pService
+                        ? tr("No djlib library found yet. It is picked up by "
+                             "itself once the djlib agent has run on this "
+                             "computer; or choose the folder above.")
+                        : tr("Off"));
         m_pUi->labelLastImport->setText(QStringLiteral("-"));
         m_pUi->labelPending->setText(QStringLiteral("-"));
         return;
     }
     const auto status = pService->status();
-    const QString library = QDir::toNativeSeparators(status.libraryPath);
+    QString library = QDir::toNativeSeparators(status.libraryPath);
+    if (status.automatic) {
+        library = tr("%1 (found automatically)").arg(library);
+    }
     if (status.problem == QLatin1String("no-library-folder")) {
         m_pUi->labelWatched->setText(
                 tr("%1 does not exist (yet). Choose the djlib library folder, "
