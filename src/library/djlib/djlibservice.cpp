@@ -726,8 +726,13 @@ void DjlibService::rearm() {
     m_retryDelayMillis = 0;
     m_writeRetryTimer.stop();
     m_writeRetryDelayMillis = 0;
+    // A write that keeps failing is not given up with the folder: its
+    // track was changed, and without the stored state those values would
+    // read as DJ edits from then on.
     commitUnsaved();
-    m_unsaved.clear();
+    if (!m_unsaved.isEmpty()) {
+        scheduleWriteRetry();
+    }
     m_failedItems.clear();
     m_probed.clear();
     // Nothing in the library folder is ever modified (no tag export). A
@@ -1170,18 +1175,21 @@ TrackPointer DjlibService::addTrack(const QString& path) {
 bool DjlibService::process(const Item& item) {
     switch (item.kind) {
     case Item::Kind::Reconcile:
-        reconcile(item.crates, item.membershipsIncluded);
-        break;
+        // Tried again: with the crates.json of now, not of the first try.
+        // The memberships queued behind that are done, and found the
+        // crates it could not create missing.
+        if (item.attempts > 0) {
+            return reconcile(m_crates.value_or(item.crates), false);
+        }
+        return reconcile(item.crates, item.membershipsIncluded);
     case Item::Kind::Sweep:
-        sweepMissingPackages();
-        break;
+        return sweepMissingPackages();
     case Item::Kind::PackageAdded:
         return packageAdded(item.name);
     case Item::Kind::Sidecar:
         return sidecarChanged(item);
     case Item::Kind::Membership:
-        applyMembership(item.name, item.crateIds);
-        break;
+        return applyMembership(item.name, item.crateIds);
     case Item::Kind::Retry:
         retry(item.name);
         break;
@@ -1189,13 +1197,16 @@ bool DjlibService::process(const Item& item) {
     return true;
 }
 
-void DjlibService::reconcile(const QList<djlib::CrateRef>& crates, bool membershipsIncluded) {
+bool DjlibService::reconcile(const QList<djlib::CrateRef>& crates, bool membershipsIncluded) {
     m_reconcileQueued = false;
     m_crates = crates;
     QStringList createdIds;
     m_reconciling = true;
-    if (!m_crateSync.reconcile(crates, &createdIds)) {
-        kLogger.warning() << "crates.json reconcile had errors";
+    // What could be done is done; the rest with the retry of this item.
+    const bool ok = !writeFailsForTesting(QStringLiteral("crates")) &&
+            m_crateSync.reconcile(crates, &createdIds);
+    if (!ok) {
+        kLogger.warning() << "crates.json reconcile had errors - retrying later";
     }
     m_reconciling = false;
     // Recreated crates start empty. After a crates.json change the membership
@@ -1203,6 +1214,7 @@ void DjlibService::reconcile(const QList<djlib::CrateRef>& crates, bool membersh
     if (!membershipsIncluded && !createdIds.isEmpty()) {
         startMembershipJob(QSet<QString>(createdIds.cbegin(), createdIds.cend()));
     }
+    return ok;
 }
 
 QSet<QString> DjlibService::allowedCrateIds() const {
@@ -1217,12 +1229,13 @@ bool DjlibService::isTrackLoaded(const TrackPointer& pTrack) const {
     return m_trackLoadedFn && m_trackLoadedFn(pTrack);
 }
 
-void DjlibService::sweepMissingPackages() {
+bool DjlibService::sweepMissingPackages() {
     // Compares the persisted rows with the current listing, so removals made
     // while Mixxx was closed are caught too. Only called with a usable
     // tracks/ dir. The track stays in the library (playlists, history) for
     // Mixxx's missing-track handling; only the djlib crates change.
     QList<DjlibStore::TrackFile> gone;
+    bool ok = true; // false: a write failed, the whole sweep is run again
     const QString tracksPath = QDir(tracksDir()).absolutePath();
     for (const auto& entry : m_store.trackFiles()) {
         if (!entry.trackId.isValid() || entry.sidecarVersion < 0 ||
@@ -1239,7 +1252,7 @@ void DjlibService::sweepMissingPackages() {
                 m_snapshot.contains(location.fileName())) {
             if (auto state = m_store.trackState(entry.djlibId)) {
                 state->file = location.fileName();
-                m_store.upsertTrackState(*state);
+                ok &= m_store.upsertTrackState(*state);
             }
             continue;
         }
@@ -1248,7 +1261,7 @@ void DjlibService::sweepMissingPackages() {
     if (gone.isEmpty()) {
         m_sweepNeeded = false;
         m_emptySince.invalidate();
-        return;
+        return ok;
     }
     // An existing but empty tracks/ (agent recreating it, a failed listing)
     // only counts once it is still empty a while later.
@@ -1260,19 +1273,26 @@ void DjlibService::sweepMissingPackages() {
         if (m_emptySince.elapsed() < m_timing.emptyConfirmMillis) {
             m_confirmTimer.start(static_cast<int>(
                     m_timing.emptyConfirmMillis - m_emptySince.elapsed()));
-            return; // m_sweepNeeded stays set
+            return ok; // m_sweepNeeded stays set
         }
     }
     m_sweepNeeded = false;
     m_emptySince.invalidate();
     for (const auto& entry : std::as_const(gone)) {
         kLogger.info() << entry.file << "is gone: leaving the djlib crates";
-        m_crateSync.setMembership(entry.trackId, {});
         m_deferred.remove(entry.djlibId);
+        // The row is only marked once the track has left the crates: a
+        // sweep run again still finds it.
+        if (writeFailsForTesting(QStringLiteral("membership")) ||
+                !m_crateSync.setMembership(entry.trackId, {})) {
+            ok = false;
+            continue;
+        }
         // -1 = package gone: if it comes back (or under a new name), its
         // sidecar is applied again; the fingerprints stay, so DJ edits win.
-        m_store.setSidecarVersion(entry.djlibId, -1);
+        ok &= m_store.setSidecarVersion(entry.djlibId, -1);
     }
+    return ok;
 }
 
 bool DjlibService::packageAdded(const QString& packageName) {
@@ -1497,13 +1517,21 @@ bool DjlibService::dropUnusedDuplicate(TrackId keptTrackId, const mixxx::FileInf
     return true;
 }
 
-void DjlibService::applyMembership(const QString& djlibId, const QStringList& crateIds) {
-    const auto state = m_store.trackState(djlibId);
-    if (!state || !state->trackId.isValid()) {
-        return;
+bool DjlibService::applyMembership(const QString& djlibId, const QStringList& crateIds) {
+    // A row that could not be stored yet says which track it is.
+    TrackId trackId;
+    const auto unsaved = m_unsaved.constFind(djlibId);
+    if (unsaved != m_unsaved.constEnd()) {
+        trackId = unsaved->state.trackId;
+    } else if (const auto state = m_store.trackState(djlibId)) {
+        trackId = state->trackId;
+    }
+    if (!trackId.isValid()) {
+        return true;
     }
     // setMembership ignores ids without a managed crate: sidecar ∩ crates.json.
-    m_crateSync.setMembership(state->trackId, crateIds);
+    return !writeFailsForTesting(QStringLiteral("membership")) &&
+            m_crateSync.setMembership(trackId, crateIds);
 }
 
 void DjlibService::retry(const QString& djlibId) {
@@ -1544,6 +1572,24 @@ void DjlibService::applyToTrack(const TrackPointer& pTrack,
     if (result.outdated) {
         m_deferred.remove(djlibId);
         return; // a row not stored yet keeps waiting for its retry
+    }
+    // The crates of this sidecar are set now: a membership still waiting
+    // for its retry is from an older one.
+    const auto olderMembership = [&djlibId](const Item& item) {
+        return item.kind == Item::Kind::Membership && item.attempts > 0 &&
+                item.name == djlibId;
+    };
+    m_failedItems.removeIf(olderMembership);
+    m_queue.removeIf(olderMembership);
+    if (!result.cratesApplied && trackId.isValid()) {
+        // Tried again like every other failed write.
+        Item membership{Item::Kind::Membership, djlibId, {}, {}, {}, false};
+        for (const auto& crate : sidecar.crates) {
+            membership.crateIds.append(crate.id);
+        }
+        membership.attempts = 1;
+        m_failedItems.append(std::move(membership));
+        scheduleWriteRetry();
     }
     Unsaved write;
     write.pTrack = pTrack;

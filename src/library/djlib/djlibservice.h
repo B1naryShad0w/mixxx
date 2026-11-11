@@ -69,8 +69,10 @@ struct ServiceTiming {
 void setReadFailureForTesting(std::function<bool(const QString& path)> fn);
 
 /// Tests only: makes a library write fail (as a busy database would) while
-/// `fn(what)` returns true; `what` is "save" (a track and its djlib state)
-/// or "add" (a new library track). Called on the main thread.
+/// `fn(what)` returns true; `what` is "save" (a track and its djlib state),
+/// "add" (a new library track), "crates" (crates.json applied to the
+/// crates) or "membership" (a track's djlib crates). Called on the main
+/// thread.
 void setWriteFailureForTesting(std::function<bool(const QString& what)> fn);
 
 /// What the agent's `library.json` says: the agent writes
@@ -334,14 +336,14 @@ class DjlibService : public QObject {
     bool commit(const QString& djlibId, const Unsaved& write);
     void commitUnsaved();
     TrackPointer addTrack(const QString& path);
-    void reconcile(const QList<djlib::CrateRef>& crates, bool membershipsIncluded);
-    void sweepMissingPackages();
+    bool reconcile(const QList<djlib::CrateRef>& crates, bool membershipsIncluded);
+    bool sweepMissingPackages();
     void locateOldFile(const Item& item, const QString& oldLocation, const QString& newPath);
     /// True if no library row (any more) is at `fileInfo`.
     bool dropUnusedDuplicate(TrackId keptTrackId, const mixxx::FileInfo& fileInfo);
     bool packageAdded(const QString& packageName);
     bool sidecarChanged(const Item& item);
-    void applyMembership(const QString& djlibId, const QStringList& crateIds);
+    bool applyMembership(const QString& djlibId, const QStringList& crateIds);
     void retry(const QString& djlibId);
     void applyToTrack(const TrackPointer& pTrack,
             const DjlibSidecar& sidecar,

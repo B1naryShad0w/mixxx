@@ -508,6 +508,90 @@ TEST_F(DjlibServiceTest, stateIsStoredOnlyAfterTheTrackIsSaved) {
     EXPECT_EQ(1, applied.count());
 }
 
+TEST_F(DjlibServiceTest, crateWritesThatFailAreRetried) {
+    writeCrates({"crate_a"});
+    startService();
+    writePackage(1);
+    writeSidecar(1, 1, {"crate_a", "crate_b"});
+    writePackage(2);
+    writeSidecar(2, 1, {"crate_a"});
+    ASSERT_TRUE(QTest::qWaitFor(
+            [this] { return hasDjlibBeats(1) && hasDjlibBeats(2); }, kTimeoutMillis));
+    ASSERT_TRUE(waitIdle());
+    EXPECT_EQ(QStringList{"crate_a"}, managedCrates(1));
+
+    auto pCrateFailures = std::make_shared<int>(0);
+    auto pMembershipFailures = std::make_shared<int>(0);
+    djlib::setWriteFailureForTesting(
+            [pCrateFailures, pMembershipFailures](const QString& what) {
+                if (what == QStringLiteral("crates")) {
+                    return (*pCrateFailures)++ < 2;
+                }
+                return what == QStringLiteral("membership") && (*pMembershipFailures)++ < 2;
+            });
+    // crates.json changes once; the crate and the membership only get
+    // written by the retries.
+    writeCrates({"crate_a", "crate_b"});
+    ASSERT_TRUE(QTest::qWaitFor(
+            [this] { return managedCrates(1) == QStringList({"crate_a", "crate_b"}); },
+            kTimeoutMillis));
+    EXPECT_GE(*pCrateFailures, 3);
+    ASSERT_TRUE(waitIdle());
+
+    // The same for a package that is gone.
+    *pMembershipFailures = 0;
+    const TrackId goneId = track(2)->getId();
+    ASSERT_TRUE(QFile::remove(tracksPath(packageName(2))));
+    ASSERT_TRUE(QFile::remove(tracksPath(sidecarName(2))));
+    ASSERT_TRUE(QTest::qWaitFor(
+            [this, goneId] { return managedCratesOf(goneId).isEmpty(); }, kTimeoutMillis));
+    EXPECT_GE(*pMembershipFailures, 3);
+    ASSERT_TRUE(waitIdle());
+    EXPECT_EQ(-1, m_pService->store().trackState(djlibId(2))->sidecarVersion);
+}
+
+TEST_F(DjlibServiceTest, writeStillFailingWhenTheFolderChangesIsNotGivenUp) {
+    writeCrates({"crate_a"});
+    auto pFail = std::make_shared<bool>(true);
+    auto pFailures = std::make_shared<int>(0);
+    djlib::setWriteFailureForTesting([pFail, pFailures](const QString& what) {
+        if (what == QStringLiteral("save") && *pFail) {
+            ++*pFailures;
+            return true;
+        }
+        return false;
+    });
+    startService();
+    QSignalSpy applied(m_pService.get(), &DjlibService::sidecarApplied);
+    writePackage(1);
+    writeSidecar(1, 1, {"crate_a"});
+    ASSERT_TRUE(QTest::qWaitFor([this] { return hasDjlibBeats(1); }, kTimeoutMillis));
+    EXPECT_GE(*pFailures, 1);
+    EXPECT_FALSE(m_pService->store().trackState(djlibId(1)));
+
+    // Another folder is chosen while the track has the sidecar's values
+    // but nothing says so yet: without the stored state they would be
+    // taken for the DJ's own from then on.
+    QTemporaryDir other;
+    ASSERT_TRUE(other.isValid());
+    m_pService->setLibraryPath(other.path());
+    const int failuresBefore = *pFailures;
+    ASSERT_TRUE(QTest::qWaitFor(
+            [pFailures, failuresBefore] { return *pFailures > failuresBefore; },
+            kTimeoutMillis));
+    EXPECT_FALSE(m_pService->store().trackState(djlibId(1)));
+    EXPECT_GT(m_pService->status().queued, 0);
+
+    *pFail = false;
+    ASSERT_TRUE(QTest::qWaitFor([&applied] { return applied.count() == 1; }, kTimeoutMillis));
+    ASSERT_TRUE(waitIdle());
+    const auto state = m_pService->store().trackState(djlibId(1));
+    ASSERT_TRUE(state);
+    EXPECT_TRUE(DjlibImporter::fingerprintsMatch(
+            state->appliedBeats, DjlibImporter::beatsFingerprint(track(1)->getBeats())));
+    EXPECT_FALSE(track(1)->isDirty());
+}
+
 TEST_F(DjlibServiceTest, trackThatCannotBeAddedIsRetried) {
     writeCrates({"crate_a"});
     auto pFailures = std::make_shared<int>(0);
