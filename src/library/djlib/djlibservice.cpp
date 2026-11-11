@@ -477,7 +477,8 @@ DjlibService::~DjlibService() {
     }
     m_generation++;
     commitUnsaved(); // last chance: the tracks themselves are saved on exit
-    djlib::setProtectedRoots({});
+    // The library folder stays protected (djlibprotect.h): the tracks
+    // still loaded are saved, and their tags exported, after this.
     m_pStopping->store(true); // running passes stop reading sidecars
     // Probes not started yet are dropped, the running one is waited for
     // (one decoder open; it can't be interrupted).
@@ -582,6 +583,16 @@ void DjlibService::startDiscovery() {
                     found.agent = djlib::readAgentLibraryFile(agentLibraryFile);
                     if (found.agent.state != djlib::AgentLibrary::State::Found) {
                         found.defaultPath = defaultLibraryPath(musicDir);
+                    }
+                    // Protected as soon as it is known, whatever becomes
+                    // of this lookup (no tag export into the agent's files).
+                    const QString path =
+                            found.agent.state == djlib::AgentLibrary::State::Found
+                            ? found.agent.libraryDir
+                            : found.defaultPath;
+                    if (!path.isEmpty()) {
+                        djlib::addProtectedRoot(QDir(path).absolutePath());
+                        djlib::addProtectedRoot(QFileInfo(path).canonicalFilePath());
                     }
                 } catch (...) {
                     found.agent.state = djlib::AgentLibrary::State::Invalid;
@@ -691,10 +702,12 @@ void DjlibService::rearm() {
     m_unsaved.clear();
     m_failedItems.clear();
     m_probed.clear();
-    // Nothing in the library folder is ever modified (no tag export).
-    djlib::setProtectedRoots(m_libraryPath.isEmpty()
-                    ? QStringList()
-                    : QStringList{QDir(m_libraryPath).absolutePath()});
+    // Nothing in the library folder is ever modified (no tag export). A
+    // folder used before stays protected too: its tracks may still be
+    // loaded or unsaved.
+    if (!m_libraryPath.isEmpty()) {
+        djlib::addProtectedRoot(QDir(m_libraryPath).absolutePath());
+    }
     m_tracksDirMissing = false;
     m_libraryDirMissing = false;
     m_confirmTimer.stop();
@@ -806,8 +819,7 @@ void DjlibService::onPassFinished(PassResult result) {
         }
         m_libraryDirMissing = !result.libraryDirOk;
         // Tracks may be known by their canonical location too.
-        djlib::setProtectedRoots({QDir(m_libraryPath).absolutePath(),
-                result.canonicalLibraryPath});
+        djlib::addProtectedRoot(result.canonicalLibraryPath);
         // Directories may only appear with the first sync. Something may
         // have changed between the listing and the watch: look once more.
         bool newlyWatched = false;

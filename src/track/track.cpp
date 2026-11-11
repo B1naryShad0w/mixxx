@@ -1554,6 +1554,11 @@ bool Track::isMarkedForMetadataExport() const {
     return m_bMarkedForMetadataExport;
 }
 
+void Track::clearMarkedForMetadataExport() {
+    const auto locked = lockMutex(&m_qMutex);
+    m_bMarkedForMetadataExport = false;
+}
+
 int Track::getRating() const {
     const auto locked = lockMutex(&m_qMutex);
     return m_record.getRating();

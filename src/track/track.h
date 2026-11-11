@@ -441,6 +441,8 @@ class Track : public QObject {
     // files that are still opened for reading.
     void markForMetadataExport();
     bool isMarkedForMetadataExport() const;
+    // djlib fork: withdraws the request (the file must not be modified).
+    void clearMarkedForMetadataExport();
 
     void setAudioProperties(
             mixxx::audio::ChannelCount channelCount,

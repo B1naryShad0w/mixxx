@@ -17,6 +17,7 @@
 #include <QTimer>
 
 #include "library/djlib/djlibimporter.h"
+#include "library/djlib/djlibprotect.h"
 #include "library/djlib/djlibservice.h"
 #include "library/djlib/djlibstore.h"
 #include "library/djlib/dlgprefdjlib.h"
@@ -116,6 +117,7 @@ bool copyByRename(const QString& source, const QString& path) {
 class DjlibServiceTest : public LibraryTest {
   protected:
     DjlibServiceTest() {
+        djlib::resetProtectedRootsForTesting();
         EXPECT_TRUE(m_libDir.isValid());
         EXPECT_TRUE(QDir(m_libDir.path()).mkpath(QStringLiteral("tracks")));
         EXPECT_TRUE(QDir(m_libDir.path()).mkpath(QStringLiteral("_djlib")));
@@ -125,6 +127,8 @@ class DjlibServiceTest : public LibraryTest {
         m_pService.reset();
         djlib::setReadFailureForTesting(nullptr);
         djlib::setWriteFailureForTesting(nullptr);
+        // Protection lasts as long as the process: not into other tests.
+        djlib::resetProtectedRootsForTesting();
     }
 
     void createService() {
@@ -671,9 +675,58 @@ TEST_F(DjlibServiceTest, metadataIsNeverExportedIntoTheLibraryFolder) {
     EXPECT_FALSE(editAndSave(inside, false));
     EXPECT_FALSE(editAndSave(tracksPath(packageName(1)), false));
 
-    // Without the service nothing is protected any more.
-    stopService();
-    EXPECT_TRUE(editAndSave(inside, true));
+    // A request that was skipped is withdrawn, not kept for later.
+    {
+        const TrackPointer pTrack = trackCollectionManager()->getOrAddTrack(
+                TrackRef::fromFilePath(inside));
+        ASSERT_TRUE(pTrack);
+        pTrack->setComment(QStringLiteral("marked"));
+        pTrack->markForMetadataExport();
+        trackCollectionManager()->saveTrack(pTrack);
+        EXPECT_FALSE(pTrack->isMarkedForMetadataExport());
+    }
+
+    // Another folder is chosen: the files of the old one are still the
+    // agent's.
+    QTemporaryDir newLibDir;
+    ASSERT_TRUE(newLibDir.isValid());
+    ASSERT_TRUE(QDir(newLibDir.path()).mkpath(QStringLiteral("tracks")));
+    m_pService->setLibraryPath(newLibDir.path());
+    ASSERT_TRUE(waitIdle());
+    const QString insideNew =
+            QDir(newLibDir.path()).filePath(QStringLiteral("tracks/extra.mp3"));
+    ASSERT_TRUE(QFile::copy(mp3, insideNew));
+    EXPECT_FALSE(editAndSave(insideNew, true));
+    EXPECT_FALSE(editAndSave(inside, true));
+    EXPECT_FALSE(editAndSave(tracksPath(packageName(1)), false));
+
+    // Mixxx exits: the service goes first, the tracks still in use (loaded
+    // in a deck, edited) are saved after it.
+    const QByteArray before = bytesOf(inside);
+    {
+        const TrackPointer pTrack = trackCollectionManager()->getOrAddTrack(
+                TrackRef::fromFilePath(inside));
+        ASSERT_TRUE(pTrack);
+        pTrack->setTitle(QStringLiteral("edited at exit"));
+        pTrack->markForMetadataExport();
+        stopService();
+        trackCollectionManager()->saveTrack(pTrack);
+    }
+    EXPECT_EQ(before, bytesOf(inside));
+    EXPECT_FALSE(editAndSave(inside, false));
+    EXPECT_TRUE(editAndSave(outside, true)); // unlike everything else
+}
+
+TEST_F(DjlibServiceTest, libraryFoundAutomaticallyIsProtectedToo) {
+    EXPECT_FALSE(djlib::hasProtectedRoots());
+    writeAgentFile(m_libPath);
+    createService();
+    m_pService->start();
+    ASSERT_TRUE(QTest::qWaitFor(
+            [this] { return !m_pService->libraryPath().isEmpty(); }, kTimeoutMillis));
+    EXPECT_TRUE(djlib::isProtectedFile(tracksPath(QStringLiteral("any.stem.mp4"))));
+    EXPECT_FALSE(djlib::isProtectedFile(
+            QDir(musicPath()).filePath(QStringLiteral("any.stem.mp4"))));
 }
 
 TEST_F(DjlibServiceTest, burstOf200SidecarsIsAppliedOnceEach) {

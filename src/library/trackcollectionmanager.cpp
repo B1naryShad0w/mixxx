@@ -302,8 +302,13 @@ ExportTrackMetadataResult TrackCollectionManager::exportTrackMetadataBeforeSavin
 
     // djlib fork: files in the djlib library folder belong to the agent
     // and are never modified, neither on request nor by the preference.
-    if (djlib::isProtectedFile(pTrack->getLocation()) ||
-            djlib::isProtectedFile(pTrack->getFileInfo().canonicalLocation())) {
+    // The path as the library has it is tested first; only if that is not
+    // protected the file system is asked where the file really is.
+    if (djlib::hasProtectedRoots() &&
+            (djlib::isProtectedFile(pTrack->getLocation()) ||
+                    djlib::isProtectedFile(pTrack->getFileInfo().canonicalLocation()))) {
+        // A request made for this track must not be carried out later.
+        pTrack->clearMarkedForMetadataExport();
         return ExportTrackMetadataResult::Skipped;
     }
 
