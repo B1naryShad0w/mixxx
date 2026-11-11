@@ -334,6 +334,7 @@ class DjlibService : public QObject {
     bool m_scanRunning = false; // library scan: no library writes meanwhile
     bool m_sweepNeeded = false; // first pass after rearm, or names were lost
     QElapsedTimer m_emptySince; // tracks/ listed empty while rows are mapped
+    QElapsedTimer m_cratesEmptySince; // crates.json empty while crates are managed
     QTimer m_confirmTimer;
     int m_packageCount = 0;
     std::shared_ptr<std::atomic<bool>> m_pStopping;

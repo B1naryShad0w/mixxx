@@ -574,6 +574,7 @@ void DjlibService::rearm() {
     m_libraryDirMissing = false;
     m_confirmTimer.stop();
     m_emptySince.invalidate();
+    m_cratesEmptySince.invalidate();
     m_sweepNeeded = true;
     m_packageCount = 0;
     m_burst.invalidate();
@@ -693,6 +694,32 @@ void DjlibService::onPassFinished(PassResult result) {
         }
         m_passRequested |= newlyWatched;
         m_snapshot = std::move(result.snapshot);
+        // A valid crates.json without crates would delete every managed
+        // crate and with them all memberships. The agent never writes that
+        // while a library has crates, so it is only believed when it still
+        // says so a while later (as for an empty tracks/).
+        if (result.crates && result.crates->isEmpty() && !m_store.crateMappings().isEmpty()) {
+            if (!m_cratesEmptySince.isValid()) {
+                kLogger.warning() << QDir(djlibDir()).filePath(kCratesFile)
+                                  << "lists no crates - keeping the djlib crates for now";
+                m_cratesEmptySince.start();
+            }
+            if (m_cratesEmptySince.elapsed() < m_timing.emptyConfirmMillis) {
+                m_confirmTimer.start(static_cast<int>(
+                        m_timing.emptyConfirmMillis - m_cratesEmptySince.elapsed()));
+                // Not adopting the stamp: the file is read again then.
+                result.crates.reset();
+                result.cratesStamp = m_cratesStamp;
+                if (result.cratesStamp) {
+                    result.cratesStamp->racy = true;
+                    result.cratesStamp->hash.clear();
+                }
+            } else {
+                m_cratesEmptySince.invalidate();
+            }
+        } else if (result.crates) {
+            m_cratesEmptySince.invalidate();
+        }
         m_cratesStamp = result.cratesStamp;
         m_packageCount = static_cast<int>(std::count_if(m_snapshot.keyBegin(),
                 m_snapshot.keyEnd(),

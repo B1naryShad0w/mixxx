@@ -561,6 +561,47 @@ TEST_F(DjlibServiceTest, packageUnreadableAtFirstIsProbedAgainWhenReplaced) {
     EXPECT_EQ(QStringList{"crate_a"}, managedCrates(1));
 }
 
+TEST_F(DjlibServiceTest, brieflyEmptyCratesFileKeepsTheCrates) {
+    m_emptyConfirmMillis = 1500;
+    writeCrates({"crate_a", "crate_b"});
+    startService();
+    writePackage(1);
+    writeSidecar(1, 1, {"crate_a"});
+    ASSERT_TRUE(QTest::qWaitFor([this] { return hasDjlibBeats(1); }, kTimeoutMillis));
+    ASSERT_TRUE(waitIdle());
+    const CrateId crateId = m_pService->store().crateMapping("crate_a")->crateId;
+
+    // A valid file without crates, replaced by the real list shortly after.
+    writeCrates({});
+    QTest::qWait(600);
+    ASSERT_TRUE(waitIdle());
+    ASSERT_TRUE(m_pService->store().crateMapping("crate_a"));
+    writeCrates({"crate_a", "crate_b"});
+    QTest::qWait(2000); // past the confirm delay
+    ASSERT_TRUE(waitIdle());
+    ASSERT_TRUE(m_pService->store().crateMapping("crate_a"));
+    EXPECT_EQ(crateId, m_pService->store().crateMapping("crate_a")->crateId);
+    EXPECT_TRUE(m_pService->store().crateMapping("crate_b"));
+    EXPECT_EQ(QStringList{"crate_a"}, managedCrates(1));
+}
+
+TEST_F(DjlibServiceTest, cratesFileThatStaysEmptyRemovesTheCrates) {
+    writeCrates({"crate_a"});
+    startService();
+    writePackage(1);
+    writeSidecar(1, 1, {"crate_a"});
+    ASSERT_TRUE(QTest::qWaitFor([this] { return hasDjlibBeats(1); }, kTimeoutMillis));
+    ASSERT_TRUE(waitIdle());
+
+    writeCrates({});
+    ASSERT_TRUE(QTest::qWaitFor(
+            [this] { return !m_pService->store().crateMapping("crate_a"); },
+            kTimeoutMillis));
+    ASSERT_TRUE(waitIdle());
+    EXPECT_TRUE(managedCrates(1).isEmpty());
+    EXPECT_TRUE(track(1));
+}
+
 TEST_F(DjlibServiceTest, burstOf200SidecarsIsAppliedOnceEach) {
     constexpr int kCount = 200;
     writeCrates({"crate_a"});
