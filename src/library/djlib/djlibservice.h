@@ -59,6 +59,9 @@ struct ServiceTiming {
     // An existing but empty tracks/ must still be empty this much later
     // before it counts as "every package removed".
     int emptyConfirmMillis = 60000;
+    // On exit: how long a running pass is waited for before it is left
+    // behind (stuck on a dead share).
+    int exitWaitMillis = 3000;
 };
 
 /// Tests only: makes reading `path` fail (as a sharing violation would)
@@ -375,7 +378,9 @@ class DjlibService : public QObject {
     QTimer m_retryTimer;
     QTimer m_writeRetryTimer;
     QElapsedTimer m_burst;
-    QThreadPool m_pool;      // passes and membership jobs
+    // Passes, membership jobs and lookups. Not a member object: left
+    // behind if a job is still stuck when Mixxx exits (~DjlibService).
+    QThreadPool* const m_pPool;
     QThreadPool m_probePool; // sample-rate probes (never delay a pass)
 
     bool m_passRunning = false;

@@ -12,6 +12,7 @@
 #include <QLineEdit>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QSemaphore>
 #include <QSignalSpy>
 #include <QTemporaryDir>
 #include <QTest>
@@ -141,6 +142,7 @@ class DjlibServiceTest : public LibraryTest {
         timing.retryMinMillis = 50;
         timing.retryMaxMillis = 400;
         timing.emptyConfirmMillis = m_emptyConfirmMillis;
+        timing.exitWaitMillis = m_exitWaitMillis;
         m_pService = std::make_unique<DjlibService>(
                 config(), trackCollectionManager(), nullptr, timing);
         m_pService->setTrackLoadedFn([this](const TrackPointer& pTrack) {
@@ -258,6 +260,7 @@ class DjlibServiceTest : public LibraryTest {
     int m_safetyPassMillis = 60000;
     QSet<TrackId> m_loaded;
     int m_emptyConfirmMillis = 300;
+    int m_exitWaitMillis = 3000;
     std::unique_ptr<DjlibService> m_pService;
 };
 
@@ -1417,6 +1420,44 @@ TEST_F(DjlibServiceTest, unreadableSidecarIsRetried) {
     ASSERT_TRUE(QTest::qWaitFor([this] { return hasDjlibBeats(1); }, kTimeoutMillis));
     EXPECT_GE(pFailures->load(), 3);
     EXPECT_EQ(QStringList{"crate_a"}, managedCrates(1));
+}
+
+TEST_F(DjlibServiceTest, passStuckOnTheFileSystemDoesNotKeepMixxxFromClosing) {
+    m_exitWaitMillis = 300;
+    struct Gate {
+        QSemaphore entered;
+        QSemaphore release;
+        std::atomic<bool> left{false};
+    };
+    auto pGate = std::make_shared<Gate>();
+    djlib::setReadFailureForTesting([pGate](const QString& path) {
+        if (path.endsWith(sidecarName(1))) {
+            // A read on a share that went away: it does not come back.
+            pGate->entered.release();
+            pGate->release.acquire();
+            pGate->left.store(true);
+        }
+        return false;
+    });
+    writeCrates({"crate_a"});
+    writePackage(1);
+    writeSidecar(1, 1, {"crate_a"});
+    writePackage(2);
+    writeSidecar(2, 1, {"crate_a"});
+    startService();
+    ASSERT_TRUE(pGate->entered.tryAcquire(1, kTimeoutMillis));
+
+    QElapsedTimer timer;
+    timer.start();
+    stopService();
+    EXPECT_LT(timer.elapsed(), 2000);
+
+    // The pass left behind ends by itself once the read returns; nothing
+    // it touches went away with the service.
+    pGate->release.release(100);
+    ASSERT_TRUE(QTest::qWaitFor([&pGate] { return pGate->left.load(); }, kTimeoutMillis));
+    QTest::qWait(300);
+    EXPECT_FALSE(track(1));
 }
 
 TEST_F(DjlibServiceTest, unreadableCratesJsonIsRetried) {

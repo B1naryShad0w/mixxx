@@ -154,11 +154,15 @@ bool isUsableDir(const QString& path) {
     return info.isDir() && info.isReadable();
 }
 
-QHash<QString, FileStamp> listTracksDir(const QString& tracksDir) {
+QHash<QString, FileStamp> listTracksDir(const QString& tracksDir,
+        const std::shared_ptr<std::atomic<bool>>& pStopping) {
     QHash<QString, FileStamp> result;
     const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
     const auto entries = QDir(tracksDir).entryInfoList(QDir::Files | QDir::NoDotAndDotDot);
     for (const auto& info : entries) {
+        if (pStopping->load()) {
+            break; // shutting down: the result is discarded
+        }
         if (isWatchedName(info.fileName())) {
             result.insert(info.fileName(), stampOf(info, nowMs));
         }
@@ -242,11 +246,17 @@ PassResult runPassUnguarded(quint64 generation,
     result.generation = generation;
     result.libraryDirOk = QFileInfo(libraryPath).isDir();
     result.canonicalLibraryPath = QFileInfo(libraryPath).canonicalFilePath();
+    if (pStopping->load()) {
+        return result; // shutting down: the result is discarded
+    }
     result.djlibDirOk = QFileInfo(djlibDir).isDir();
     result.tracksDirOk = isUsableDir(tracksDir);
     // A missing/unreadable dir (unplugged drive, dropped share) is not
     // "every package removed": keep the old snapshot.
-    result.snapshot = result.tracksDirOk ? listTracksDir(tracksDir) : snapshot;
+    result.snapshot = result.tracksDirOk ? listTracksDir(tracksDir, pStopping) : snapshot;
+    if (pStopping->load()) {
+        return result;
+    }
 
     result.cratesStamp = cratesStamp;
     const QFileInfo cratesInfo(cratesPath);
@@ -388,13 +398,14 @@ DjlibService::DjlibService(UserSettingsPointer pConfig,
           m_store(pTrackCollectionManager->internalCollection()->database()),
           m_crateSync(pTrackCollectionManager->internalCollection(), &m_store),
           m_importer(&m_crateSync),
+          m_pPool(new QThreadPool()),
           m_pStopping(std::make_shared<std::atomic<bool>>(false)) {
     if (!m_store.initialize()) {
         kLogger.warning() << "Cannot create the djlib tables";
     }
     // One pass/membership job at a time; probes have their own pool so 200
     // new packages never delay the next pass.
-    m_pool.setMaxThreadCount(1);
+    m_pPool->setMaxThreadCount(1);
     m_probePool.setMaxThreadCount(1);
     m_retryTimer.setSingleShot(true);
     connect(&m_retryTimer, &QTimer::timeout, this, &DjlibService::requestPass);
@@ -483,8 +494,17 @@ DjlibService::~DjlibService() {
     // Probes not started yet are dropped, the running one is waited for
     // (one decoder open; it can't be interrupted).
     m_probePool.clear();
-    m_pool.waitForDone();
     m_probePool.waitForDone();
+    // A pass stuck on a dead share or a sleeping disk must not keep Mixxx
+    // from closing. Its job only has copies of what it works with (and
+    // m_pStopping, which it shares), and its result is dropped with this
+    // object, so it can be left alone: the pool is then never destroyed
+    // (that would wait for the job after all).
+    if (m_pPool->waitForDone(m_timing.exitWaitMillis)) {
+        delete m_pPool;
+    } else {
+        kLogger.warning() << "A pass over the library folder is still running - not waiting";
+    }
 }
 
 djlib::AgentLibrary djlib::readAgentLibraryFile(const QString& path) {
@@ -577,7 +597,7 @@ void DjlibService::startDiscovery() {
         QString defaultPath;
         QString canonicalPath; // of the one that counts; empty: missing
     };
-    QtConcurrent::run(&m_pool,
+    QtConcurrent::run(m_pPool,
             [agentLibraryFile = m_agentLibraryFile, musicDir = m_musicDir] {
                 Found found;
                 try {
@@ -795,7 +815,7 @@ void DjlibService::startPass() {
     // (a sleeping disk or a dead share would freeze the UI): the pass does,
     // and onPassFinished() watches and registers what it found.
     m_passRunning = true;
-    QtConcurrent::run(&m_pool,
+    QtConcurrent::run(m_pPool,
             runPass,
             m_generation,
             m_libraryPath,
@@ -931,7 +951,7 @@ void DjlibService::startMembershipJob(const QSet<QString>& crateIds) {
     }
     ++m_jobsRunning;
     const quint64 generation = m_generation;
-    QtConcurrent::run(&m_pool,
+    QtConcurrent::run(m_pPool,
             collectMemberships,
             tracksDir(),
             m_snapshot,
@@ -1386,7 +1406,7 @@ bool DjlibService::sidecarChanged(const Item& item) {
 void DjlibService::locateOldFile(
         const Item& item, const QString& oldLocation, const QString& newPath) {
     ++m_jobsRunning;
-    QtConcurrent::run(&m_pool,
+    QtConcurrent::run(m_pPool,
             [oldLocation, newPath] {
                 OldFile oldFile;
                 oldFile.location = oldLocation;
