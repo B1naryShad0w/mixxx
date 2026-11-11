@@ -1,11 +1,13 @@
 #include <gtest/gtest.h>
 
+#include <QCoreApplication>
 #include <QSqlQuery>
 #include <QStringList>
 
 #include "library/djlib/djlibcratesync.h"
 #include "library/djlib/djlibstore.h"
 #include "library/trackset/crate/crate.h"
+#include "library/trackset/crate/cratetablemodel.h"
 #include "test/librarytest.h"
 #include "track/track.h"
 
@@ -341,4 +343,31 @@ TEST_F(DjlibCrateSyncTest, membershipNeverTouchesDjCrates) {
     EXPECT_EQ(QList<CrateId>({dj}), cratesOfTrack(t2));
     EXPECT_EQ(2u, internalCollection()->crates().countCrateTracks(dj));
     EXPECT_FALSE(readCrate(dj).isLocked());
+}
+
+// The crate that is open in the track list reloads when the service changes
+// its tracks; before, the list only caught up after leaving and re-entering.
+TEST_F(DjlibCrateSyncTest, openCrateListFollowsMembershipChanges) {
+    ASSERT_TRUE(m_sync.reconcile({{"crate_a", "House"}, {"crate_b", "Techno"}}));
+    const TrackId t1 = addTrack(kTrack1);
+    const TrackId t2 = addTrack(kTrack2);
+
+    CrateTableModel model(nullptr, trackCollectionManager());
+    model.selectCrate(managedCrateId("crate_a"));
+    model.select();
+    ASSERT_EQ(0, model.rowCount());
+
+    ASSERT_TRUE(m_sync.setMembership(t1, {"crate_a"}));
+    ASSERT_TRUE(m_sync.setMembership(t2, {"crate_a"}));
+    QCoreApplication::processEvents();
+    EXPECT_EQ(2, model.rowCount());
+
+    // A change to another crate leaves the open list alone
+    ASSERT_TRUE(m_sync.setMembership(t2, {"crate_b"}));
+    QCoreApplication::processEvents();
+    EXPECT_EQ(1, model.rowCount());
+
+    ASSERT_TRUE(m_sync.setMembership(t1, {}));
+    QCoreApplication::processEvents();
+    EXPECT_EQ(0, model.rowCount());
 }

@@ -1,5 +1,6 @@
 #include "library/trackset/crate/cratetablemodel.h"
 
+#include <QTimer>
 #include <QtDebug>
 
 #include "library/dao/trackschema.h"
@@ -23,6 +24,22 @@ CrateTableModel::CrateTableModel(
                   pParent,
                   pTrackCollectionManager,
                   "mixxx.db.model.crate") {
+    connect(m_pTrackCollectionManager->internalCollection(),
+            &TrackCollection::crateTracksChanged,
+            this,
+            &CrateTableModel::slotCrateTracksChanged);
+}
+
+void CrateTableModel::slotCrateTracksChanged(CrateId crateId) {
+    if (!m_selectedCrate.isValid() || crateId != m_selectedCrate || m_reloadPending) {
+        return;
+    }
+    // One reload for a burst of changes, after the caller is done.
+    m_reloadPending = true;
+    QTimer::singleShot(0, this, [this] {
+        m_reloadPending = false;
+        select();
+    });
 }
 
 void CrateTableModel::selectCrate(CrateId crateId) {

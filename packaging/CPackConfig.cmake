@@ -17,6 +17,18 @@ set(
 )
 set(CPACK_SOURCE_PACKAGE_FILE_NAME "${CPACK_PACKAGE_FILE_NAME}-source")
 
+# djlib fork: the Windows installer carries the fork release as a fourth
+# version field (v2.6.0-djlib.4 -> 2.6.0.4), so Apps & features and the djlib
+# sync app can tell which build is installed. Windows Installer compares only
+# the first three fields; fork builds replace each other as same-version
+# upgrades (AllowSameVersionUpgrades in CPack's WiX template).
+if(
+  CPACK_GENERATOR STREQUAL "WIX"
+  AND PACKAGE_VERSION MATCHES "^v([0-9]+\\.[0-9]+\\.[0-9]+)-djlib\\.([0-9]+)$"
+)
+  set(CPACK_PACKAGE_VERSION "${CMAKE_MATCH_1}.${CMAKE_MATCH_2}")
+endif()
+
 # The upstream version must not contain hyphen
 # . for normal versioning + for advance and ~ for decline the version
 # dpkg --compare-versions 2.3~alpha~1234~g8163 lt 2.3~beta~1234~g8163 && echo true

@@ -27,7 +27,13 @@ class CrateTableModel final : public TrackSetTableModel {
     Capabilities getCapabilities() const final;
     QString modelKey(bool noSearch) const override;
 
+  private slots:
+    // djlib fork: the crate on screen changed behind this model's back
+    // (the djlib service syncing crates.json), so the list is reloaded.
+    void slotCrateTracksChanged(CrateId crateId);
+
   private:
+    bool m_reloadPending = false;
     CrateId m_selectedCrate;
     QHash<CrateId, QString> m_searchTexts;
 };
