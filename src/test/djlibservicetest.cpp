@@ -358,6 +358,40 @@ TEST_F(DjlibServiceTest, passThatThrowsIsRetried) {
     ASSERT_TRUE(waitIdle());
 }
 
+TEST_F(DjlibServiceTest, rewriteWithSameSizeAndTimeIsNoticed) {
+    writeCrates({"crate_a"});
+    startService();
+    writePackage(1);
+    writeSidecar(1, 1, {"crate_a"});
+    ASSERT_TRUE(QTest::qWaitFor([this] { return hasDjlibBeats(1); }, kTimeoutMillis));
+    ASSERT_TRUE(waitIdle());
+
+    // Rewritten within the timestamp granularity: same size, same time.
+    const QString path = tracksPath(sidecarName(1));
+    const QFileInfo before(path);
+    const QDateTime mtime = before.lastModified();
+    auto json = sidecarJson(1, 2, crateRefs({"crate_a"}));
+    json["grid"] = QJsonObject{{"first_beat_s", 0.1234}, {"bpm", 126.0}};
+    const QByteArray data = QJsonDocument(json).toJson();
+    ASSERT_EQ(before.size(), data.size());
+    {
+        QFile file(path);
+        ASSERT_TRUE(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        ASSERT_EQ(data.size(), file.write(data));
+        file.flush();
+        ASSERT_TRUE(file.setFileTime(mtime, QFileDevice::FileModificationTime));
+    }
+    ASSERT_EQ(mtime, QFileInfo(path).lastModified());
+    m_pService->requestPass();
+    ASSERT_TRUE(QTest::qWaitFor(
+            [this] {
+                const auto state = m_pService->store().trackState(djlibId(1));
+                return state && state->sidecarVersion == 2;
+            },
+            kTimeoutMillis));
+    EXPECT_NEAR(126.0, track(1)->getBpm(), 1e-6);
+}
+
 TEST_F(DjlibServiceTest, burstOf200SidecarsIsAppliedOnceEach) {
     constexpr int kCount = 200;
     writeCrates({"crate_a"});
@@ -810,11 +844,26 @@ TEST_F(DjlibServiceTest, statusShowsMissingTracksFolder) {
     QTemporaryDir other;
     ASSERT_TRUE(other.isValid());
     createService();
+    // The status is what the last pass saw.
     m_pService->setLibraryPath(other.path());
+    ASSERT_TRUE(waitIdle());
     EXPECT_EQ(QStringLiteral("no-tracks-folder"), m_pService->status().problem);
+    EXPECT_FALSE(m_pService->status().watching);
     m_pService->setLibraryPath(other.path() + QStringLiteral("/nope"));
+    ASSERT_TRUE(waitIdle());
     EXPECT_EQ(QStringLiteral("no-library-folder"), m_pService->status().problem);
     m_pService->setLibraryPath(m_libDir.path());
+    ASSERT_TRUE(waitIdle());
+    EXPECT_EQ(QString(), m_pService->status().problem);
+    EXPECT_TRUE(m_pService->status().watching);
+
+    // tracks/ created later is picked up and watched.
+    m_pService->setLibraryPath(other.path());
+    ASSERT_TRUE(waitIdle());
+    ASSERT_TRUE(QDir(other.path()).mkpath(QStringLiteral("tracks")));
+    m_pService->requestPass();
+    ASSERT_TRUE(QTest::qWaitFor(
+            [this] { return m_pService->status().watching; }, kTimeoutMillis));
     EXPECT_EQ(QString(), m_pService->status().problem);
 }
 

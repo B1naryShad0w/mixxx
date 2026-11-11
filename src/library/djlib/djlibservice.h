@@ -29,9 +29,14 @@ class TrackCollectionManager;
 namespace djlib {
 
 /// Size and modification time of a watched file (the snapshot diff key).
+/// `racy`: seen so soon after its modification time that another write may
+/// leave both unchanged; `hash` (sidecars, crates.json) then tells on the
+/// next pass. Neither takes part in the comparison.
 struct FileStamp {
     qint64 size = -1;
     qint64 mtimeMs = 0;
+    bool racy = false;
+    QByteArray hash;
     friend bool operator==(const FileStamp& lhs, const FileStamp& rhs) {
         return lhs.size == rhs.size && lhs.mtimeMs == rhs.mtimeMs;
     }
@@ -59,6 +64,7 @@ void setReadFailureForTesting(std::function<bool(const QString& path)> fn);
 /// A sidecar read and parsed on a worker thread.
 struct ParsedSidecar {
     QString sidecarName; // file name in <lib>/tracks
+    bool packageChanged = false; // its package is new or was replaced
     QByteArray json;
     DjlibSidecar sidecar;
 };
@@ -76,6 +82,8 @@ struct PassResult {
     // false: tracks/ missing or unreadable; `snapshot` is the old one then
     // and nothing counts as removed.
     bool tracksDirOk = false;
+    bool libraryDirOk = false; // the library folder exists
+    bool djlibDirOk = false;   // <lib>/_djlib exists
     QHash<QString, FileStamp> snapshot; // name -> stamp, filtered names only
     std::optional<FileStamp> cratesStamp;
     std::optional<QList<CrateRef>> crates; // set iff changed and valid
@@ -97,7 +105,10 @@ struct PassResult {
 /// - A pass lists the directories and diffs them against a snapshot
 ///   (name -> size, mtime) on a worker thread; new/changed sidecars (and the
 ///   sidecars of new/changed packages) and crates.json are read and parsed
-///   there too. Only `*.stem.mp4` and `*.djlib.json` are considered; names
+///   there too. A sidecar read within 3 s of its modification time is
+///   compared by content once more on the next pass. All file system access
+///   to the library folder happens there; the main thread only adds the
+///   watches and looks at the results. Only `*.stem.mp4` and `*.djlib.json` are considered; names
 ///   with a ".tmp<digits>" component (the agent's temp files) are ignored.
 ///   Files are only stat'ed and read (at most `djlib::kMaxJsonBytes`), never
 ///   held open or changed.
@@ -224,7 +235,7 @@ class DjlibService : public QObject {
 
     void rearm();
     void registerLibraryRoot();
-    void watchDirectories();
+    bool watchDirectory(const QString& dir);
     void slotDirectoryChanged();
     void startPass();
     void onPassFinished(djlib::PassResult result);
@@ -278,6 +289,7 @@ class DjlibService : public QObject {
     bool m_reconcileQueued = false;
     bool m_reconciling = false;
     bool m_tracksDirMissing = false;
+    bool m_libraryDirMissing = false;
     int m_retryDelayMillis = 0;
     bool m_sweepNeeded = false; // first pass after rearm, or names were lost
     QElapsedTimer m_emptySince; // tracks/ listed empty while rows are mapped
