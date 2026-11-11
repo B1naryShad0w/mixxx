@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <QSqlQuery>
 #include <QDir>
 #include <atomic>
 #include <memory>
@@ -129,6 +130,7 @@ class DjlibServiceTest : public LibraryTest {
         djlib::setWriteFailureForTesting(nullptr);
         // Protection lasts as long as the process: not into other tests.
         djlib::resetProtectedRootsForTesting();
+        djlib::setPathCaseSensitivityForTesting(std::nullopt);
     }
 
     void createService() {
@@ -231,6 +233,17 @@ class DjlibServiceTest : public LibraryTest {
         }
         result.sort();
         return result;
+    }
+
+    /// The library entry stored with exactly this location, if any.
+    TrackId trackIdAt(const QString& location) {
+        QSqlQuery query(internalCollection()->database());
+        query.prepare(QStringLiteral(
+                "SELECT library.id FROM library INNER JOIN track_locations "
+                "ON library.location=track_locations.id "
+                "WHERE track_locations.location=:location"));
+        query.bindValue(QStringLiteral(":location"), location);
+        return query.exec() && query.next() ? TrackId(query.value(0)) : TrackId();
     }
 
     bool waitIdle() {
@@ -1210,6 +1223,150 @@ TEST_F(DjlibServiceTest, libraryFolderMoveRelocatesTracks) {
     EXPECT_TRUE(hasDjlibBeats(1));
     EXPECT_EQ(QStringList{"crate_a"}, managedCratesOf(trackId));
     stopService(); // before newLib goes away
+}
+
+TEST_F(DjlibServiceTest, pathsAreComparedCleanedAndByThePlatformsCase) {
+    EXPECT_TRUE(djlib::samePath(QStringLiteral("/a/lib"), QStringLiteral("/a/lib/")));
+    EXPECT_TRUE(djlib::samePath(QStringLiteral("/a/lib"), QStringLiteral("/a//x/../lib/.")));
+    EXPECT_FALSE(djlib::samePath(QStringLiteral("/a/lib"), QStringLiteral("/a/lib2")));
+    EXPECT_FALSE(djlib::samePath(QStringLiteral("/a/lib"), QString()));
+    EXPECT_TRUE(djlib::samePath(QString(), QString()));
+
+    djlib::setPathCaseSensitivityForTesting(Qt::CaseSensitive);
+    EXPECT_FALSE(djlib::samePath(QStringLiteral("C:/Users/Dj/Music/djlib"),
+            QStringLiteral("c:/users/dj/music/DJLIB/")));
+    // As on Windows and macOS.
+    djlib::setPathCaseSensitivityForTesting(Qt::CaseInsensitive);
+    EXPECT_TRUE(djlib::samePath(QStringLiteral("C:/Users/Dj/Music/djlib"),
+            QStringLiteral("c:/users/dj/music/DJLIB/")));
+    djlib::addProtectedRoot(QStringLiteral("C:/Users/Dj/Music/djlib"));
+    EXPECT_TRUE(djlib::isProtectedFile(QStringLiteral("c:/users/dj/music/DJLIB/tracks/a.mp4")));
+    EXPECT_FALSE(djlib::isProtectedFile(QStringLiteral("c:/users/dj/music/djlib2/a.mp4")));
+}
+
+TEST_F(DjlibServiceTest, folderChosenInAnotherSpellingIsNotRearmed) {
+    djlib::setPathCaseSensitivityForTesting(Qt::CaseInsensitive);
+    writeCrates({"crate_a"});
+    startService();
+    writePackage(1);
+    writeSidecar(1, 1, {"crate_a"});
+    ASSERT_TRUE(QTest::qWaitFor([this] { return hasDjlibBeats(1); }, kTimeoutMillis));
+    ASSERT_TRUE(waitIdle());
+    const QString used = m_pService->libraryPath();
+    int statusChanges = 0;
+    QObject::connect(m_pService.get(),
+            &DjlibService::statusChanged,
+            m_pService.get(),
+            [&statusChanges] { ++statusChanges; });
+    // What Windows would hand out for the same folder.
+    ASSERT_NE(used, used.toUpper());
+    m_pService->setLibraryPath(used.toUpper() + QStringLiteral("/tracks/../"));
+    EXPECT_EQ(used, m_pService->libraryPath());
+    EXPECT_TRUE(m_pService->status().watching);
+    EXPECT_EQ(0, statusChanges); // not armed again
+    EXPECT_EQ(1, m_pService->status().trackFiles);
+}
+
+TEST_F(DjlibServiceTest, sameFolderReachedByAnotherPathKeepsTheLibraryEntries) {
+    // The library folder is known by two paths (a link here; on Windows
+    // also another case, a junction, a mapped drive).
+    QTemporaryDir linkDir;
+    ASSERT_TRUE(linkDir.isValid());
+    const QString linkPath = QDir(linkDir.path()).filePath(QStringLiteral("djlib"));
+    ASSERT_TRUE(QFile::link(m_libPath, linkPath));
+    const QString linkedPackage =
+            QDir(linkPath).filePath(QStringLiteral("tracks/") + packageName(1));
+
+    writeCrates({"crate_a"});
+    writePackage(1);
+    writeSidecar(1, 1, {"crate_a"});
+    createService();
+    m_pService->setLibraryPath(linkPath);
+    ASSERT_TRUE(QTest::qWaitFor(
+            [&] {
+                const auto state = m_pService->store().trackState(djlibId(1));
+                return state && state->sidecarVersion == 1;
+            },
+            kTimeoutMillis));
+    ASSERT_TRUE(waitIdle());
+    TrackId trackId;
+    {
+        const auto pTrack = trackByPath(linkedPackage);
+        ASSERT_TRUE(pTrack);
+        trackId = pTrack->getId();
+        addDjHotCue(pTrack);
+        trackCollectionManager()->saveTrack(pTrack);
+    }
+    const auto locationOf = [this](TrackId id) {
+        return internalCollection()->getTrackDAO().getTrackLocation(id);
+    };
+    ASSERT_EQ(linkedPackage, locationOf(trackId));
+    stopService();
+
+    // Next start: the folder is named by its real path (the agent's
+    // library.json instead of the old setting, say).
+    startService();
+    ASSERT_TRUE(waitIdle());
+    ASSERT_TRUE(QTest::qWaitFor(
+            [&] { return locationOf(trackId) == tracksPath(packageName(1)); },
+            kTimeoutMillis));
+    ASSERT_TRUE(waitIdle());
+    // The same entry, with the DJ's work; not a second one for the file.
+    const auto state = m_pService->store().trackState(djlibId(1));
+    ASSERT_TRUE(state);
+    EXPECT_EQ(trackId, state->trackId);
+    EXPECT_TRUE(hasDjHotCue(trackCollectionManager()->getTrackById(trackId)));
+    EXPECT_EQ(QStringList{"crate_a"}, managedCratesOf(trackId));
+    EXPECT_FALSE(trackIdAt(linkedPackage).isValid());
+    EXPECT_EQ(trackId,
+            trackIdAt(tracksPath(packageName(1))));
+
+    // A newer sidecar goes to that entry too.
+    writeSidecar(1, 2, {"crate_a"});
+    ASSERT_TRUE(QTest::qWaitFor(
+            [&] {
+                const auto newer = m_pService->store().trackState(djlibId(1));
+                return newer && newer->sidecarVersion == 2;
+            },
+            kTimeoutMillis));
+    EXPECT_EQ(trackId, m_pService->store().trackState(djlibId(1))->trackId);
+    stopService();
+}
+
+TEST_F(DjlibServiceTest, agentNamingTheSameFolderDifferentlyChangesNothing) {
+    m_safetyPassMillis = 300;
+    QTemporaryDir linkDir;
+    ASSERT_TRUE(linkDir.isValid());
+    const QString linkPath = QDir(linkDir.path()).filePath(QStringLiteral("djlib"));
+    ASSERT_TRUE(QFile::link(m_libPath, linkPath));
+
+    writeCrates({"crate_a"});
+    writePackage(1);
+    writeSidecar(1, 1, {"crate_a"});
+    writeAgentFile(linkPath);
+    createService();
+    m_pService->start();
+    ASSERT_TRUE(QTest::qWaitFor(
+            [&] {
+                const auto state = m_pService->store().trackState(djlibId(1));
+                return state && state->sidecarVersion == 1;
+            },
+            kTimeoutMillis));
+    ASSERT_TRUE(waitIdle());
+    ASSERT_EQ(linkPath, m_pService->libraryPath());
+    const TrackId trackId = m_pService->store().trackState(djlibId(1))->trackId;
+
+    // Same folder: by its real path, and spelled with detours.
+    for (const QString& spelling : {m_libPath, QString(linkPath + QStringLiteral("//tracks/../"))}) {
+        writeAgentFile(spelling);
+        QTest::qWait(1000); // several lookups
+        ASSERT_TRUE(waitIdle());
+        EXPECT_EQ(linkPath, m_pService->libraryPath());
+        EXPECT_TRUE(m_pService->status().watching);
+        EXPECT_EQ(trackId, m_pService->store().trackState(djlibId(1))->trackId);
+        EXPECT_FALSE(trackIdAt(tracksPath(packageName(1))).isValid());
+    }
+    stopService();
 }
 
 TEST_F(DjlibServiceTest, missingTracksDirKeepsCrates) {

@@ -9,10 +9,11 @@
 namespace {
 
 #if defined(Q_OS_WIN) || defined(Q_OS_MACOS)
-constexpr Qt::CaseSensitivity kCaseSensitivity = Qt::CaseInsensitive;
+constexpr bool kCaseInsensitive = true;
 #else
-constexpr Qt::CaseSensitivity kCaseSensitivity = Qt::CaseSensitive;
+constexpr bool kCaseInsensitive = false;
 #endif
+std::atomic<bool> s_caseInsensitive{kCaseInsensitive};
 
 Q_GLOBAL_STATIC(QReadWriteLock, s_lock)
 Q_GLOBAL_STATIC(QStringList, s_prefixes) // cleaned, with a trailing '/'
@@ -29,7 +30,7 @@ void djlib::addProtectedRoot(const QString& root) {
         prefix += QLatin1Char('/');
     }
     const QWriteLocker locker(s_lock());
-    if (!s_prefixes()->contains(prefix, kCaseSensitivity)) {
+    if (!s_prefixes()->contains(prefix, pathCaseSensitivity())) {
         s_prefixes()->append(prefix);
         s_count.store(static_cast<int>(s_prefixes()->size()));
     }
@@ -57,9 +58,27 @@ bool djlib::isProtectedFile(const QString& location) {
     const QString path = QDir::cleanPath(location);
     const QReadLocker locker(s_lock());
     for (const auto& prefix : std::as_const(*s_prefixes())) {
-        if (path.startsWith(prefix, kCaseSensitivity)) {
+        if (path.startsWith(prefix, pathCaseSensitivity())) {
             return true;
         }
     }
     return false;
+}
+
+Qt::CaseSensitivity djlib::pathCaseSensitivity() {
+    return s_caseInsensitive.load() ? Qt::CaseInsensitive : Qt::CaseSensitive;
+}
+
+bool djlib::samePath(const QString& a, const QString& b) {
+    if (a.isEmpty() || b.isEmpty()) {
+        return a.isEmpty() && b.isEmpty();
+    }
+    return QDir::cleanPath(a).compare(QDir::cleanPath(b), pathCaseSensitivity()) == 0;
+}
+
+void djlib::setPathCaseSensitivityForTesting(
+        std::optional<Qt::CaseSensitivity> caseSensitivity) {
+    s_caseInsensitive.store(caseSensitivity
+                    ? *caseSensitivity == Qt::CaseInsensitive
+                    : kCaseInsensitive);
 }

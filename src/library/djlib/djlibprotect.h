@@ -2,6 +2,7 @@
 
 #include <QString>
 #include <QStringList>
+#include <optional>
 
 namespace djlib {
 
@@ -23,10 +24,22 @@ QStringList protectedRoots();
 bool hasProtectedRoots();
 
 /// True if `location` (an absolute file path) is below a protected folder.
-/// Names are compared without case on Windows and macOS. Thread-safe.
+/// Names are compared by `pathCaseSensitivity()`. Thread-safe.
 bool isProtectedFile(const QString& location);
 
 /// Tests only: nothing is protected any more.
 void resetProtectedRootsForTesting();
+
+/// How file names compare here: without case on Windows and macOS.
+Qt::CaseSensitivity pathCaseSensitivity();
+
+/// True if both paths spell the same file or folder: compared cleaned (no
+/// "..", no doubled or trailing slashes) and by `pathCaseSensitivity()`.
+/// The file system is not asked, so links are not seen through.
+bool samePath(const QString& a, const QString& b);
+
+/// Tests only: compare names as Windows does (`Qt::CaseInsensitive`), or
+/// as this platform does again (`std::nullopt`).
+void setPathCaseSensitivityForTesting(std::optional<Qt::CaseSensitivity> caseSensitivity);
 
 } // namespace djlib

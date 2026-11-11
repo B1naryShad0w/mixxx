@@ -160,7 +160,11 @@ struct PassResult {
 /// - Renamed/moved files (same djlib track id, new file or library folder): if
 ///   the mapped library track's file is gone and the new file isn't in the
 ///   library yet, the row is relocated (`TrackCollectionManager::relocateTrack`)
-///   so cues, edits and history stay. An entry for the new file that this
+///   so cues, edits and history stay. The same happens when the entry
+///   points to the very same file by another spelling (other case on
+///   Windows/macOS, a link, the folder named differently): it is never added
+///   a second time. Whether a file outside of tracks/ still exists, and if
+///   it is the same file, is found out on a worker. An entry for the new file that this
 ///   service added itself since Mixxx started and nobody used is dropped
 ///   for that; any other entry is kept. Otherwise the new file is a new library
 ///   track: the old one leaves the managed crates and the djlib state starts
@@ -262,6 +266,14 @@ class DjlibService : public QObject {
     void idle();
 
   private:
+    /// What a worker found out about the file a library entry points to,
+    /// when that is not in tracks/ (the listing knows those).
+    struct OldFile {
+        QString location;      // of the library entry, as asked
+        bool exists = false;
+        bool sameFile = false; // it is the package, reached by another path
+    };
+
     struct Item {
         enum class Kind {
             Reconcile,
@@ -278,6 +290,7 @@ class DjlibService : public QObject {
         QStringList crateIds;
         bool membershipsIncluded = false;
         int attempts = 0; // failed so far
+        std::optional<OldFile> oldFile = std::nullopt; // Sidecar: looked up for it
     };
 
     struct Deferred {
@@ -320,11 +333,11 @@ class DjlibService : public QObject {
     TrackPointer addTrack(const QString& path);
     void reconcile(const QList<djlib::CrateRef>& crates, bool membershipsIncluded);
     void sweepMissingPackages();
-    void relocateIfMoved(TrackId trackId, const QString& newPath);
+    void locateOldFile(const Item& item, const QString& oldLocation, const QString& newPath);
     /// True if no library row (any more) is at `fileInfo`.
     bool dropUnusedDuplicate(TrackId keptTrackId, const mixxx::FileInfo& fileInfo);
     bool packageAdded(const QString& packageName);
-    bool sidecarChanged(const djlib::ParsedSidecar& parsed);
+    bool sidecarChanged(const Item& item);
     void applyMembership(const QString& djlibId, const QStringList& crateIds);
     void retry(const QString& djlibId);
     void applyToTrack(const TrackPointer& pTrack,
@@ -334,6 +347,9 @@ class DjlibService : public QObject {
     QSet<QString> allowedCrateIds() const;
     void scheduleReconcile();
     void checkIdle();
+
+    /// The library entry stored with exactly this location, if any.
+    TrackId trackIdAt(const QString& location) const;
 
     QString tracksDir() const;
     QString djlibDir() const;
@@ -348,6 +364,7 @@ class DjlibService : public QObject {
     TrackLoadedFn m_trackLoadedFn;
 
     QString m_libraryPath;
+    QString m_canonicalLibraryPath; // from the last pass; empty: not known
     QString m_registeredRoot;
     quint64 m_generation = 0;
 

@@ -575,6 +575,7 @@ void DjlibService::startDiscovery() {
     struct Found {
         djlib::AgentLibrary agent;
         QString defaultPath;
+        QString canonicalPath; // of the one that counts; empty: missing
     };
     QtConcurrent::run(&m_pool,
             [agentLibraryFile = m_agentLibraryFile, musicDir = m_musicDir] {
@@ -591,8 +592,9 @@ void DjlibService::startDiscovery() {
                             ? found.agent.libraryDir
                             : found.defaultPath;
                     if (!path.isEmpty()) {
+                        found.canonicalPath = QFileInfo(path).canonicalFilePath();
                         djlib::addProtectedRoot(QDir(path).absolutePath());
-                        djlib::addProtectedRoot(QFileInfo(path).canonicalFilePath());
+                        djlib::addProtectedRoot(found.canonicalPath);
                     }
                 } catch (...) {
                     found.agent.state = djlib::AgentLibrary::State::Invalid;
@@ -616,7 +618,13 @@ void DjlibService::startDiscovery() {
                 } else if (path.isEmpty()) {
                     path = found.defaultPath;
                 }
-                if (path != m_libraryPath) {
+                // The folder in use under another spelling (other case on
+                // Windows/macOS, a link) is the same library: it stays as
+                // it is, the library entries keep their locations.
+                const bool sameFolder = djlib::samePath(path, m_libraryPath) ||
+                        (!found.canonicalPath.isEmpty() &&
+                                djlib::samePath(found.canonicalPath, m_canonicalLibraryPath));
+                if (!sameFolder) {
                     kLogger.info() << "djlib library found:" << path;
                     m_libraryPath = path;
                     rearm();
@@ -668,7 +676,7 @@ void DjlibService::usePath(const QString& configuredPath, bool force) {
         startDiscovery();
         return;
     }
-    const bool unchanged = !m_automatic && configuredPath == m_libraryPath &&
+    const bool unchanged = !m_automatic && djlib::samePath(configuredPath, m_libraryPath) &&
             m_safetyTimer.isActive();
     m_automatic = false;
     ++m_discoveryEpoch;
@@ -708,6 +716,7 @@ void DjlibService::rearm() {
     if (!m_libraryPath.isEmpty()) {
         djlib::addProtectedRoot(QDir(m_libraryPath).absolutePath());
     }
+    m_canonicalLibraryPath.clear();
     m_tracksDirMissing = false;
     m_libraryDirMissing = false;
     m_confirmTimer.stop();
@@ -820,6 +829,9 @@ void DjlibService::onPassFinished(PassResult result) {
         m_libraryDirMissing = !result.libraryDirOk;
         // Tracks may be known by their canonical location too.
         djlib::addProtectedRoot(result.canonicalLibraryPath);
+        if (!result.canonicalLibraryPath.isEmpty()) {
+            m_canonicalLibraryPath = result.canonicalLibraryPath;
+        }
         // Directories may only appear with the first sync. Something may
         // have changed between the listing and the watch: look once more.
         bool newlyWatched = false;
@@ -1146,7 +1158,7 @@ bool DjlibService::process(const Item& item) {
     case Item::Kind::PackageAdded:
         return packageAdded(item.name);
     case Item::Kind::Sidecar:
-        return sidecarChanged(item.sidecar);
+        return sidecarChanged(item);
     case Item::Kind::Membership:
         applyMembership(item.name, item.crateIds);
         break;
@@ -1203,7 +1215,7 @@ void DjlibService::sweepMissingPackages() {
         const QFileInfo location(m_pTrackCollectionManager->internalCollection()
                         ->getTrackDAO()
                         .getTrackLocation(entry.trackId));
-        if (location.absolutePath() == tracksPath &&
+        if (djlib::samePath(location.absolutePath(), tracksPath) &&
                 m_snapshot.contains(location.fileName())) {
             if (auto state = m_store.trackState(entry.djlibId)) {
                 state->file = location.fileName();
@@ -1261,7 +1273,8 @@ bool DjlibService::packageAdded(const QString& packageName) {
     return true;
 }
 
-bool DjlibService::sidecarChanged(const ParsedSidecar& parsed) {
+bool DjlibService::sidecarChanged(const Item& item) {
+    const ParsedSidecar& parsed = item.sidecar;
     const DjlibSidecar& sidecar = parsed.sidecar;
     QString packageName = packageNameOf(parsed.sidecarName);
     if (!m_snapshot.contains(packageName) && m_snapshot.contains(sidecar.file)) {
@@ -1285,22 +1298,61 @@ bool DjlibService::sidecarChanged(const ParsedSidecar& parsed) {
         return m_store.upsertTrackState(state);
     }
     const QString path = QDir(tracksDir()).filePath(packageName);
-    // Fast path (startup pass): nothing newer to apply and the mapped library
-    // track still is this file (not moved), so no track needs loading.
-    if (existing && existing->trackId.isValid() && !existing->pendingJson &&
-            !m_deferred.contains(sidecar.trackId) &&
-            !m_unsaved.contains(sidecar.trackId) &&
-            sidecar.sidecarVersion <= existing->sidecarVersion &&
-            m_pTrackCollectionManager->internalCollection()
-                            ->getTrackDAO()
-                            .getTrackLocation(existing->trackId) ==
-                    mixxx::FileInfo(path).location()) {
-        return true;
-    }
+    const mixxx::FileInfo fileInfo(path);
+    // Is the library entry of this djlib track (if it has one) this file?
+    bool sameFile = false;
     if (existing && existing->trackId.isValid()) {
-        relocateIfMoved(existing->trackId, path);
+        const QString oldLocation =
+                m_pTrackCollectionManager->internalCollection()
+                        ->getTrackDAO()
+                        .getTrackLocation(existing->trackId);
+        const QFileInfo oldInfo(oldLocation);
+        bool moved = false; // the old file is gone
+        if (oldLocation.isEmpty()) {
+            // No longer in the library: added again below.
+        } else if (djlib::samePath(oldLocation, fileInfo.location())) {
+            sameFile = true;
+        } else if (djlib::samePath(oldInfo.absolutePath(), QDir(tracksDir()).absolutePath())) {
+            // Another name in tracks/ (renamed by the agent: a title fix):
+            // the last listing knows whether that file is still there.
+            moved = !m_snapshot.contains(oldInfo.fileName());
+        } else if (!item.oldFile || item.oldFile->location != oldLocation) {
+            // Somewhere else (the library folder moved, or is reached by
+            // another path now): a worker looks; the item comes back.
+            locateOldFile(item, oldLocation, path);
+            return true;
+        } else {
+            sameFile = item.oldFile->sameFile;
+            moved = !sameFile && !item.oldFile->exists;
+        }
+        if (moved || (sameFile && oldLocation != fileInfo.location())) {
+            // Keep the entry with all DJ edits, cues and history, under the
+            // new name. An entry already made for that name (the package
+            // was listed before its sidecar arrived) is dropped if this
+            // service added it and nobody has used it; else, for a moved
+            // file, the new entry takes over below.
+            if (dropUnusedDuplicate(existing->trackId, fileInfo) &&
+                    !m_pTrackCollectionManager->relocateTrack(existing->trackId, fileInfo)) {
+                kLogger.warning() << "Cannot relocate" << oldLocation << "->" << path;
+            }
+        }
+        // Fast path (startup pass): nothing newer to apply and the mapped
+        // library track still is this file, so no track needs loading.
+        if (sameFile && !existing->pendingJson &&
+                !m_deferred.contains(sidecar.trackId) &&
+                !m_unsaved.contains(sidecar.trackId) &&
+                sidecar.sidecarVersion <= existing->sidecarVersion) {
+            return true;
+        }
     }
-    const TrackPointer pTrack = addTrack(path);
+    // The same file is never added a second time, however it is spelled.
+    TrackPointer pTrack;
+    if (sameFile) {
+        pTrack = m_pTrackCollectionManager->getTrackById(existing->trackId);
+    }
+    if (!pTrack) {
+        pTrack = addTrack(path);
+    }
     if (!pTrack) {
         kLogger.warning() << "Cannot add" << path;
         return false;
@@ -1331,48 +1383,64 @@ bool DjlibService::sidecarChanged(const ParsedSidecar& parsed) {
     return true;
 }
 
-void DjlibService::relocateIfMoved(TrackId trackId, const QString& newPath) {
-    const mixxx::FileInfo newFileInfo(newPath);
-    const QString oldLocation =
-            m_pTrackCollectionManager->internalCollection()->getTrackDAO().getTrackLocation(
-                    trackId);
-    if (oldLocation.isEmpty() || oldLocation == newFileInfo.location()) {
-        return; // not in the library, or not moved
+void DjlibService::locateOldFile(
+        const Item& item, const QString& oldLocation, const QString& newPath) {
+    ++m_jobsRunning;
+    QtConcurrent::run(&m_pool,
+            [oldLocation, newPath] {
+                OldFile oldFile;
+                oldFile.location = oldLocation;
+                try {
+                    const QFileInfo oldInfo(oldLocation);
+                    oldFile.exists = oldInfo.exists();
+                    if (oldFile.exists) {
+                        const QString canonical = oldInfo.canonicalFilePath();
+                        oldFile.sameFile = !canonical.isEmpty() &&
+                                djlib::samePath(canonical,
+                                        QFileInfo(newPath).canonicalFilePath());
+                    }
+                } catch (...) {
+                    kLogger.warning() << "Looking for" << oldLocation << "failed";
+                }
+                return oldFile;
+            })
+            .then(this, [this, item, generation = m_generation](const OldFile& oldFile) {
+                --m_jobsRunning;
+                if (generation == m_generation) {
+                    Item located = item;
+                    located.oldFile = oldFile;
+                    enqueue(std::move(located));
+                }
+                checkIdle();
+            });
+}
+
+TrackId DjlibService::trackIdAt(const QString& location) const {
+    QSqlQuery query(m_pTrackCollectionManager->internalCollection()->database());
+    query.prepare(QStringLiteral(
+            "SELECT library.id FROM library INNER JOIN track_locations "
+            "ON library.location=track_locations.id "
+            "WHERE track_locations.location=:location"));
+    query.bindValue(QStringLiteral(":location"), location);
+    if (!query.exec() || !query.next()) {
+        return TrackId();
     }
-    // Is the old file still there (a copy)? For a file in tracks/ the last
-    // listing knows, with exact names: a rename that only changes the case
-    // is a rename also on Windows. Only an old file elsewhere (library
-    // folder moved) is looked up.
-    const QFileInfo oldInfo(oldLocation);
-    const bool oldStillThere = oldInfo.absolutePath() == QDir(tracksDir()).absolutePath()
-            ? m_snapshot.contains(oldInfo.fileName())
-            : oldInfo.exists();
-    if (oldStillThere) {
-        return;
-    }
-    // The new file may already be a library track: the package was listed
-    // (and added) before its sidecar arrived. A row nobody has used yet is
-    // dropped in favour of the old one; else the new track takes over.
-    if (!dropUnusedDuplicate(trackId, newFileInfo)) {
-        return;
-    }
-    // Renamed by the agent (title fix) or library folder moved: keep the
-    // row with all DJ edits, cues and history.
-    if (!m_pTrackCollectionManager->relocateTrack(trackId, newFileInfo)) {
-        kLogger.warning() << "Cannot relocate" << oldLocation << "->" << newPath;
-    }
+    return TrackId(query.value(0));
 }
 
 bool DjlibService::dropUnusedDuplicate(TrackId keptTrackId, const mixxx::FileInfo& fileInfo) {
-    TrackId duplicateId;
+    // The entry spelled exactly like this (not: the same file by another
+    // path, which may be the kept entry itself).
+    const TrackId duplicateId = trackIdAt(fileInfo.location());
+    if (!duplicateId.isValid()) {
+        return true; // no row in the way
+    }
+    if (duplicateId == keptTrackId) {
+        return false;
+    }
     {
-        const TrackPointer pDuplicate =
-                m_pTrackCollectionManager->getTrackByRef(TrackRef::fromFileInfo(fileInfo));
+        const TrackPointer pDuplicate = m_pTrackCollectionManager->getTrackById(duplicateId);
         if (!pDuplicate) {
-            return true; // no row in the way
-        }
-        duplicateId = pDuplicate->getId();
-        if (!duplicateId.isValid() || duplicateId == keptTrackId) {
             return false;
         }
         const auto cues = pDuplicate->getCuePoints();
