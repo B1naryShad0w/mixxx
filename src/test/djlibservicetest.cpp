@@ -1127,6 +1127,55 @@ TEST_F(DjlibServiceTest, renameOntoAUsedLibraryEntryLetsItTakeOver) {
     EXPECT_TRUE(managedCratesOf(trackId).isEmpty());
 }
 
+TEST_F(DjlibServiceTest, renameOntoAnEntryNotAddedByTheServiceKeepsThatEntry) {
+    writeCrates({"crate_a"});
+    startService();
+    writePackage(1);
+    writeSidecar(1, 1, {"crate_a"});
+    ASSERT_TRUE(QTest::qWaitFor([this] { return hasDjlibBeats(1); }, kTimeoutMillis));
+    const TrackId trackId = track(1)->getId();
+    ASSERT_TRUE(waitIdle());
+    stopService();
+
+    // Renamed while Mixxx was closed; the new file became a library track
+    // without the service (a rescan, a drag and drop) and the DJ rated it.
+    const QString newName = QStringLiteral("Artist - Better Title [10000001].stem.mp4");
+    ASSERT_TRUE(QFile::rename(tracksPath(packageName(1)), tracksPath(newName)));
+    ASSERT_TRUE(QFile::remove(tracksPath(sidecarName(1))));
+    TrackId newTrackId;
+    {
+        const auto pTrack = trackCollectionManager()->getOrAddTrack(
+                TrackRef::fromFilePath(tracksPath(newName)));
+        ASSERT_TRUE(pTrack);
+        newTrackId = pTrack->getId();
+        ASSERT_NE(trackId, newTrackId);
+        pTrack->setRating(4);
+        pTrack->setComment(QStringLiteral("opener"));
+        trackCollectionManager()->saveTrack(pTrack);
+    }
+    QJsonObject json = sidecarJson(1, 2, crateRefs({"crate_a"}));
+    json["file"] = newName;
+    ASSERT_TRUE(writeByRename(
+            tracksPath(QStringLiteral("Artist - Better Title [10000001].djlib.json")),
+            QJsonDocument(json).toJson()));
+
+    startServiceFromConfig();
+    ASSERT_TRUE(QTest::qWaitFor(
+            [this, newTrackId] {
+                const auto state = m_pService->store().trackState(djlibId(1));
+                return state && state->trackId == newTrackId && state->sidecarVersion == 2;
+            },
+            kTimeoutMillis));
+    ASSERT_TRUE(waitIdle());
+    // Not purged: it takes over, with what the DJ did to it.
+    const auto pTrack = trackCollectionManager()->getTrackById(newTrackId);
+    ASSERT_TRUE(pTrack);
+    EXPECT_EQ(4, pTrack->getRating());
+    EXPECT_EQ(QStringLiteral("opener"), pTrack->getComment());
+    EXPECT_EQ(QStringList{"crate_a"}, managedCratesOf(newTrackId));
+    EXPECT_TRUE(trackCollectionManager()->getTrackById(trackId));
+}
+
 TEST_F(DjlibServiceTest, libraryFolderMoveRelocatesTracks) {
     writeCrates({"crate_a"});
     startService();

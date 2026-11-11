@@ -160,7 +160,9 @@ struct PassResult {
 /// - Renamed/moved files (same djlib track id, new file or library folder): if
 ///   the mapped library track's file is gone and the new file isn't in the
 ///   library yet, the row is relocated (`TrackCollectionManager::relocateTrack`)
-///   so cues, edits and history stay. Otherwise the new file is a new library
+///   so cues, edits and history stay. An entry for the new file that this
+///   service added itself since Mixxx started and nobody used is dropped
+///   for that; any other entry is kept. Otherwise the new file is a new library
 ///   track: the old one leaves the managed crates and the djlib state starts
 ///   fresh (old fingerprints would read as DJ edits).
 ///
@@ -392,6 +394,7 @@ class DjlibService : public QObject {
     QHash<QString, Deferred> m_deferred; // djlib id -> sidecar
     QSet<TrackId> m_probing;
     QHash<TrackId, int> m_probed; // probes done since the package changed
+    QSet<TrackId> m_addedTrackIds; // library entries created here, this session
 
     QDateTime m_lastImport;
     QString m_lastImportFile;

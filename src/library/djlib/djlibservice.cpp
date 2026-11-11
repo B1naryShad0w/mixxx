@@ -1126,7 +1126,13 @@ TrackPointer DjlibService::addTrack(const QString& path) {
     if (writeFailsForTesting(QStringLiteral("add"))) {
         return TrackPointer();
     }
-    return m_pTrackCollectionManager->getOrAddTrack(TrackRef::fromFilePath(path));
+    bool alreadyInLibrary = false;
+    const TrackPointer pTrack = m_pTrackCollectionManager->getOrAddTrack(
+            TrackRef::fromFilePath(path), &alreadyInLibrary);
+    if (pTrack && !alreadyInLibrary && pTrack->getId().isValid()) {
+        m_addedTrackIds.insert(pTrack->getId());
+    }
+    return pTrack;
 }
 
 bool DjlibService::process(const Item& item) {
@@ -1373,7 +1379,11 @@ bool DjlibService::dropUnusedDuplicate(TrackId keptTrackId, const mixxx::FileInf
         const bool hasHotCues = std::any_of(cues.cbegin(), cues.cend(), [](const CuePointer& pCue) {
             return pCue && pCue->getType() == mixxx::CueType::HotCue;
         });
-        if (isTrackLoaded(pDuplicate) || pDuplicate->getTimesPlayed() > 0 ||
+        // Only an entry this service added itself since Mixxx started is
+        // ever dropped: an older one may carry work of the DJ that is not
+        // looked for here (loops, rating, colour, comment, grid edits...).
+        if (!m_addedTrackIds.contains(duplicateId) ||
+                isTrackLoaded(pDuplicate) || pDuplicate->getTimesPlayed() > 0 ||
                 hasHotCues || m_store.trackStateByTrackId(duplicateId)) {
             return false;
         }
@@ -1391,6 +1401,7 @@ bool DjlibService::dropUnusedDuplicate(TrackId keptTrackId, const mixxx::FileInf
     if (m_pTrackCollectionManager->getTrackById(duplicateId)) {
         return false; // not purged
     }
+    m_addedTrackIds.remove(duplicateId);
     m_probed.remove(duplicateId);
     for (auto it = m_deferred.begin(); it != m_deferred.end();) {
         it = it->trackId == duplicateId ? m_deferred.erase(it) : ++it;
