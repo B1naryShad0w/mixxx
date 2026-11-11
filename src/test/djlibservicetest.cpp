@@ -119,6 +119,7 @@ class DjlibServiceTest : public LibraryTest {
     ~DjlibServiceTest() override {
         m_pService.reset();
         djlib::setReadFailureForTesting(nullptr);
+        djlib::setWriteFailureForTesting(nullptr);
     }
 
     void createService() {
@@ -390,6 +391,151 @@ TEST_F(DjlibServiceTest, rewriteWithSameSizeAndTimeIsNoticed) {
             },
             kTimeoutMillis));
     EXPECT_NEAR(126.0, track(1)->getBpm(), 1e-6);
+}
+
+TEST_F(DjlibServiceTest, queueRestsDuringLibraryScan) {
+    writeCrates({"crate_a"});
+    startService();
+    ASSERT_TRUE(waitIdle());
+
+    emit trackCollectionManager()->libraryScanStarted();
+    writePackage(1);
+    writeSidecar(1, 1, {"crate_a"});
+    // The pass runs, its results wait.
+    ASSERT_TRUE(QTest::qWaitFor(
+            [this] { return m_pService->status().queued > 0; }, kTimeoutMillis));
+    QTest::qWait(500);
+    EXPECT_FALSE(track(1));
+    EXPECT_FALSE(m_pService->store().trackState(djlibId(1)));
+    EXPECT_GT(m_pService->status().queued, 0);
+
+    emit trackCollectionManager()->libraryScanFinished();
+    ASSERT_TRUE(QTest::qWaitFor([this] { return hasDjlibBeats(1); }, kTimeoutMillis));
+    ASSERT_TRUE(waitIdle());
+    EXPECT_EQ(QStringList{"crate_a"}, managedCrates(1));
+    EXPECT_EQ(1, m_pService->store().trackState(djlibId(1))->sidecarVersion);
+}
+
+TEST_F(DjlibServiceTest, stateIsStoredOnlyAfterTheTrackIsSaved) {
+    writeCrates({"crate_a"});
+    auto pFail = std::make_shared<bool>(true);
+    auto pFailures = std::make_shared<int>(0);
+    djlib::setWriteFailureForTesting([pFail, pFailures](const QString& what) {
+        if (what == QStringLiteral("save") && *pFail) {
+            ++*pFailures;
+            return true;
+        }
+        return false;
+    });
+    startService();
+    QSignalSpy applied(m_pService.get(), &DjlibService::sidecarApplied);
+    writePackage(1);
+    writeSidecar(1, 1, {"crate_a"});
+    // Applied in memory, but the save keeps failing: no fingerprints may be
+    // stored, and the write stays queued.
+    ASSERT_TRUE(QTest::qWaitFor([pFailures] { return *pFailures >= 3; }, kTimeoutMillis));
+    EXPECT_TRUE(hasDjlibBeats(1));
+    EXPECT_FALSE(m_pService->store().trackState(djlibId(1)));
+    EXPECT_GT(m_pService->status().queued, 0);
+    EXPECT_EQ(0, applied.count());
+
+    // A newer sidecar meanwhile is not mistaken for a DJ edit.
+    auto json = sidecarJson(1, 2, crateRefs({"crate_a"}));
+    json["grid"] = QJsonObject{{"first_beat_s", 0.2}, {"bpm", 126.0}};
+    ASSERT_TRUE(writeByRename(tracksPath(sidecarName(1)), QJsonDocument(json).toJson()));
+    ASSERT_TRUE(QTest::qWaitFor(
+            [this] { return track(1) && std::abs(track(1)->getBpm() - 126.0) < 1e-6; },
+            kTimeoutMillis));
+    EXPECT_FALSE(m_pService->store().trackState(djlibId(1)));
+
+    // The database is back: no file changes, the retry alone stores it.
+    *pFail = false;
+    ASSERT_TRUE(QTest::qWaitFor(
+            [this] {
+                const auto state = m_pService->store().trackState(djlibId(1));
+                return state && state->sidecarVersion == 2;
+            },
+            kTimeoutMillis));
+    ASSERT_TRUE(waitIdle());
+    const auto state = m_pService->store().trackState(djlibId(1));
+    EXPECT_TRUE(DjlibImporter::fingerprintsMatch(
+            state->appliedBeats, DjlibImporter::beatsFingerprint(track(1)->getBeats())));
+    EXPECT_FALSE(track(1)->isDirty());
+    EXPECT_EQ(1, applied.count());
+}
+
+TEST_F(DjlibServiceTest, trackThatCannotBeAddedIsRetried) {
+    writeCrates({"crate_a"});
+    auto pFailures = std::make_shared<int>(0);
+    djlib::setWriteFailureForTesting([pFailures](const QString& what) {
+        return what == QStringLiteral("add") && (*pFailures)++ < 2;
+    });
+    startService();
+    // A package without sidecar, and one with: nothing changes on disk
+    // afterwards, only the retry can add them.
+    writePackage(1);
+    writePackage(2);
+    writeSidecar(2, 1, {"crate_a"});
+    ASSERT_TRUE(QTest::qWaitFor(
+            [this] { return track(1) && hasDjlibBeats(2); }, kTimeoutMillis));
+    EXPECT_GE(*pFailures, 3);
+    ASSERT_TRUE(waitIdle());
+    EXPECT_EQ(QStringList{"crate_a"}, managedCrates(2));
+}
+
+TEST_F(DjlibServiceTest, sidecarFileFieldMayDifferFromTheNameOnDisk) {
+    writeCrates({"crate_a"});
+    startService();
+    // Renamed on disk; the sidecar's "file" still has the old name.
+    const QString package = QStringLiteral("Artist - New Title [10000001].stem.mp4");
+    const QString sidecar = QStringLiteral("Artist - New Title [10000001].djlib.json");
+    ASSERT_TRUE(copyByRename(getTestDir().filePath(kAlacStem), tracksPath(package)));
+    ASSERT_TRUE(writeByRename(tracksPath(sidecar),
+            QJsonDocument(sidecarJson(1, 1, crateRefs({"crate_a"}))).toJson()));
+    writePackage(2);
+    writeSidecar(2, 1, {"crate_a"});
+    ASSERT_TRUE(QTest::qWaitFor([this] { return hasDjlibBeats(2); }, kTimeoutMillis));
+    ASSERT_TRUE(waitIdle());
+    const auto pTrack = trackByPath(tracksPath(package));
+    ASSERT_TRUE(pTrack);
+    EXPECT_EQ(package, m_pService->store().trackState(djlibId(1))->file);
+
+    // Another package goes: the sweep must not take track 1 for gone.
+    ASSERT_TRUE(QFile::remove(tracksPath(packageName(2))));
+    ASSERT_TRUE(QFile::remove(tracksPath(sidecarName(2))));
+    ASSERT_TRUE(QTest::qWaitFor(
+            [this] { return m_pService->store().trackState(djlibId(2))->sidecarVersion == -1; },
+            kTimeoutMillis));
+    ASSERT_TRUE(waitIdle());
+    EXPECT_EQ(QStringList{"crate_a"}, managedCratesOf(pTrack->getId()));
+    EXPECT_EQ(1, m_pService->store().trackState(djlibId(1))->sidecarVersion);
+}
+
+TEST_F(DjlibServiceTest, sweepRepairsRowWithAnOutdatedFileName) {
+    writeCrates({"crate_a"});
+    startService();
+    writePackage(1);
+    writeSidecar(1, 1, {"crate_a"});
+    writePackage(2);
+    writeSidecar(2, 1, {"crate_a"});
+    ASSERT_TRUE(QTest::qWaitFor(
+            [this] { return hasDjlibBeats(1) && hasDjlibBeats(2); }, kTimeoutMillis));
+    ASSERT_TRUE(waitIdle());
+    // A row as an earlier version stored it: the sidecar's stale "file".
+    auto state = m_pService->store().trackState(djlibId(1));
+    ASSERT_TRUE(state);
+    state->file = QStringLiteral("Artist - Old Title [10000001].stem.mp4");
+    ASSERT_TRUE(m_pService->store().upsertTrackState(*state));
+
+    ASSERT_TRUE(QFile::remove(tracksPath(packageName(2))));
+    ASSERT_TRUE(QFile::remove(tracksPath(sidecarName(2))));
+    ASSERT_TRUE(QTest::qWaitFor(
+            [this] { return m_pService->store().trackState(djlibId(2))->sidecarVersion == -1; },
+            kTimeoutMillis));
+    ASSERT_TRUE(waitIdle());
+    EXPECT_EQ(QStringList{"crate_a"}, managedCrates(1));
+    EXPECT_EQ(1, m_pService->store().trackState(djlibId(1))->sidecarVersion);
+    EXPECT_EQ(packageName(1), m_pService->store().trackState(djlibId(1))->file);
 }
 
 TEST_F(DjlibServiceTest, burstOf200SidecarsIsAppliedOnceEach) {

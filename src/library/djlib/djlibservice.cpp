@@ -9,6 +9,7 @@
 #include <QStandardPaths>
 #include <QtConcurrent>
 #include <algorithm>
+#include <utility>
 
 #include "library/trackcollection.h"
 #include "library/trackcollectionmanager.h"
@@ -40,6 +41,15 @@ const QString kSidecarSuffix = QStringLiteral(".djlib.json");
 DjlibService* s_pInstance = nullptr;
 
 std::function<bool(const QString&)> s_readFailureForTesting;
+std::function<bool(const QString&)> s_writeFailureForTesting;
+
+/// A queue item that failed (track not added, row not written) is tried
+/// this often before it waits for the next change of its file.
+constexpr int kMaxItemAttempts = 10;
+
+bool writeFailsForTesting(const QString& what) {
+    return s_writeFailureForTesting && s_writeFailureForTesting(what);
+}
 
 bool isPackageName(const QString& name) {
     return name.endsWith(kPackageSuffix, Qt::CaseInsensitive);
@@ -376,6 +386,18 @@ DjlibService::DjlibService(UserSettingsPointer pConfig,
     m_probePool.setMaxThreadCount(1);
     m_retryTimer.setSingleShot(true);
     connect(&m_retryTimer, &QTimer::timeout, this, &DjlibService::requestPass);
+    m_writeRetryTimer.setSingleShot(true);
+    connect(&m_writeRetryTimer, &QTimer::timeout, this, &DjlibService::slotWriteRetry);
+    // The library scanner writes the database from its own thread and keeps
+    // it locked for long stretches: our writes would fail. Wait for it.
+    connect(m_pTrackCollectionManager,
+            &TrackCollectionManager::libraryScanStarted,
+            this,
+            &DjlibService::slotLibraryScanStarted);
+    connect(m_pTrackCollectionManager,
+            &TrackCollectionManager::libraryScanFinished,
+            this,
+            &DjlibService::slotLibraryScanFinished);
     m_confirmTimer.setSingleShot(true);
     connect(&m_confirmTimer, &QTimer::timeout, this, &DjlibService::requestPass);
 
@@ -416,6 +438,9 @@ DjlibService::DjlibService(UserSettingsPointer pConfig,
                     for (auto it = m_deferred.begin(); it != m_deferred.end();) {
                         it = purged.contains(it->trackId) ? m_deferred.erase(it) : ++it;
                     }
+                    for (auto it = m_unsaved.begin(); it != m_unsaved.end();) {
+                        it = purged.contains(it->state.trackId) ? m_unsaved.erase(it) : ++it;
+                    }
                     emit statusChanged();
                 }
             });
@@ -434,6 +459,7 @@ DjlibService::~DjlibService() {
         s_pInstance = nullptr;
     }
     m_generation++;
+    commitUnsaved(); // last chance: the tracks themselves are saved on exit
     m_pStopping->store(true); // running passes stop reading sidecars
     // Probes not started yet are dropped, the running one is waited for
     // (one decoder open; it can't be interrupted).
@@ -444,6 +470,10 @@ DjlibService::~DjlibService() {
 
 void djlib::setReadFailureForTesting(std::function<bool(const QString& path)> fn) {
     s_readFailureForTesting = std::move(fn);
+}
+
+void djlib::setWriteFailureForTesting(std::function<bool(const QString& what)> fn) {
+    s_writeFailureForTesting = std::move(fn);
 }
 
 // static
@@ -528,6 +558,11 @@ void DjlibService::rearm() {
     m_queueTimer.stop();
     m_retryTimer.stop();
     m_retryDelayMillis = 0;
+    m_writeRetryTimer.stop();
+    m_writeRetryDelayMillis = 0;
+    commitUnsaved();
+    m_unsaved.clear();
+    m_failedItems.clear();
     m_tracksDirMissing = false;
     m_libraryDirMissing = false;
     m_confirmTimer.stop();
@@ -641,7 +676,9 @@ void DjlibService::onPassFinished(PassResult result) {
         // have changed between the listing and the watch: look once more.
         bool newlyWatched = false;
         if (result.tracksDirOk) {
-            registerLibraryRoot();
+            if (!m_scanRunning) {
+                registerLibraryRoot(); // else: with the pass after the scan
+            }
             newlyWatched |= watchDirectory(tracksDir());
         }
         if (result.djlibDirOk) {
@@ -775,31 +812,134 @@ void DjlibService::scheduleReconcile() {
 
 void DjlibService::enqueue(Item item) {
     m_queue.enqueue(std::move(item));
-    if (!m_queueTimer.isActive()) {
+    if (!m_queueTimer.isActive() && !m_scanRunning) {
         m_queueTimer.start();
     }
 }
 
 void DjlibService::processNext() {
+    if (m_scanRunning) {
+        return; // resumed by slotLibraryScanFinished()
+    }
     if (!m_queue.isEmpty()) {
-        const Item item = m_queue.dequeue();
-        process(item);
+        Item item = m_queue.dequeue();
+        if (!process(item)) {
+            // Usually the database was busy: try again later.
+            if (++item.attempts < kMaxItemAttempts) {
+                m_failedItems.append(std::move(item));
+                scheduleWriteRetry();
+            } else {
+                kLogger.warning() << "Giving up on" << item.name
+                                  << "until it changes or Mixxx restarts";
+            }
+        }
     }
     if (!m_queue.isEmpty()) {
         m_queueTimer.start(); // next item in the next event-loop turn
     } else {
+        if (m_failedItems.isEmpty() && m_unsaved.isEmpty()) {
+            m_writeRetryDelayMillis = 0;
+        }
         emit statusChanged();
         checkIdle();
     }
 }
 
 void DjlibService::checkIdle() {
-    if (m_queue.isEmpty() && !m_passRunning && m_jobsRunning == 0) {
+    if (m_queue.isEmpty() && !m_passRunning && m_jobsRunning == 0 &&
+            m_failedItems.isEmpty() && m_unsaved.isEmpty()) {
         emit idle();
     }
 }
 
-void DjlibService::process(const Item& item) {
+void DjlibService::slotLibraryScanStarted() {
+    m_scanRunning = true;
+    m_queueTimer.stop();
+    m_writeRetryTimer.stop();
+    emit statusChanged();
+}
+
+void DjlibService::slotLibraryScanFinished() {
+    if (!m_scanRunning) {
+        return;
+    }
+    m_scanRunning = false;
+    if (!m_queue.isEmpty()) {
+        m_queueTimer.start();
+    }
+    if (!m_failedItems.isEmpty() || !m_unsaved.isEmpty()) {
+        m_writeRetryDelayMillis = 0;
+        scheduleWriteRetry();
+    }
+    // What the scan made of the folder, and the root if it wasn't added yet.
+    startPass();
+    emit statusChanged();
+}
+
+void DjlibService::scheduleWriteRetry() {
+    if (m_scanRunning || m_writeRetryTimer.isActive()) {
+        return;
+    }
+    m_writeRetryDelayMillis = m_writeRetryDelayMillis == 0
+            ? m_timing.retryMinMillis
+            : std::min(2 * m_writeRetryDelayMillis, m_timing.retryMaxMillis);
+    m_writeRetryTimer.start(m_writeRetryDelayMillis);
+}
+
+void DjlibService::slotWriteRetry() {
+    if (m_scanRunning) {
+        return;
+    }
+    commitUnsaved();
+    const QList<Item> failedItems = std::exchange(m_failedItems, {});
+    for (const auto& item : failedItems) {
+        enqueue(item);
+    }
+    if (!m_unsaved.isEmpty()) {
+        scheduleWriteRetry();
+    }
+    emit statusChanged();
+    checkIdle();
+}
+
+bool DjlibService::commit(const QString& djlibId, const Unsaved& write) {
+    // The track first: fingerprints of values the library never got would
+    // make the next sidecar take the old values for DJ edits.
+    if (writeFailsForTesting(QStringLiteral("save")) ||
+            m_pTrackCollectionManager->saveTrack(write.pTrack) ==
+                    TrackCollectionManager::SaveTrackResult::Failed) {
+        kLogger.warning() << "Saving failed for" << djlibId << "- retrying later";
+        return false;
+    }
+    if (!m_store.upsertTrackState(write.state)) {
+        kLogger.warning() << "Storing the state of" << djlibId << "failed - retrying later";
+        return false;
+    }
+    if (write.appliedVersion > 0) {
+        m_lastImport = QDateTime::currentDateTime();
+        m_lastImportFile = write.state.file;
+        emit sidecarApplied(djlibId, write.appliedVersion);
+    }
+    return true;
+}
+
+void DjlibService::commitUnsaved() {
+    const QStringList djlibIds = m_unsaved.keys();
+    for (const auto& djlibId : djlibIds) {
+        if (commit(djlibId, m_unsaved.value(djlibId))) {
+            m_unsaved.remove(djlibId);
+        }
+    }
+}
+
+TrackPointer DjlibService::addTrack(const QString& path) {
+    if (writeFailsForTesting(QStringLiteral("add"))) {
+        return TrackPointer();
+    }
+    return m_pTrackCollectionManager->getOrAddTrack(TrackRef::fromFilePath(path));
+}
+
+bool DjlibService::process(const Item& item) {
     switch (item.kind) {
     case Item::Kind::Reconcile:
         reconcile(item.crates, item.membershipsIncluded);
@@ -808,11 +948,9 @@ void DjlibService::process(const Item& item) {
         sweepMissingPackages();
         break;
     case Item::Kind::PackageAdded:
-        packageAdded(item.name);
-        break;
+        return packageAdded(item.name);
     case Item::Kind::Sidecar:
-        sidecarChanged(item.sidecar);
-        break;
+        return sidecarChanged(item.sidecar);
     case Item::Kind::Membership:
         applyMembership(item.name, item.crateIds);
         break;
@@ -820,6 +958,7 @@ void DjlibService::process(const Item& item) {
         retry(item.name);
         break;
     }
+    return true;
 }
 
 void DjlibService::reconcile(const QList<djlib::CrateRef>& crates, bool membershipsIncluded) {
@@ -856,11 +995,27 @@ void DjlibService::sweepMissingPackages() {
     // tracks/ dir. The track stays in the library (playlists, history) for
     // Mixxx's missing-track handling; only the djlib crates change.
     QList<DjlibStore::TrackFile> gone;
+    const QString tracksPath = QDir(tracksDir()).absolutePath();
     for (const auto& entry : m_store.trackFiles()) {
-        if (entry.trackId.isValid() && entry.sidecarVersion >= 0 &&
-                !m_snapshot.contains(entry.file)) {
-            gone.append(entry);
+        if (!entry.trackId.isValid() || entry.sidecarVersion < 0 ||
+                m_snapshot.contains(entry.file)) {
+            continue;
         }
+        // The row may have the sidecar's "file" of an older version, which
+        // can be behind the name on disk: the library knows where the track
+        // really is.
+        const QFileInfo location(m_pTrackCollectionManager->internalCollection()
+                        ->getTrackDAO()
+                        .getTrackLocation(entry.trackId));
+        if (location.absolutePath() == tracksPath &&
+                m_snapshot.contains(location.fileName())) {
+            if (auto state = m_store.trackState(entry.djlibId)) {
+                state->file = location.fileName();
+                m_store.upsertTrackState(*state);
+            }
+            continue;
+        }
+        gone.append(entry);
     }
     if (gone.isEmpty()) {
         m_sweepNeeded = false;
@@ -892,24 +1047,24 @@ void DjlibService::sweepMissingPackages() {
     }
 }
 
-void DjlibService::packageAdded(const QString& packageName) {
+bool DjlibService::packageAdded(const QString& packageName) {
     if (!m_snapshot.contains(packageName)) {
-        return; // gone again meanwhile
+        return true; // gone again meanwhile
     }
     // Import it so it shows in the library; its sidecar follows.
     const QString path = QDir(tracksDir()).filePath(packageName);
-    const TrackPointer pTrack =
-            m_pTrackCollectionManager->getOrAddTrack(TrackRef::fromFilePath(path));
+    const TrackPointer pTrack = addTrack(path);
     if (!pTrack) {
         kLogger.warning() << "Cannot add" << path;
-        return;
+        return false;
     }
     if (!pTrack->getSampleRate().isValid() && !isTrackLoaded(pTrack)) {
         startProbe(pTrack);
     }
+    return true;
 }
 
-void DjlibService::sidecarChanged(const ParsedSidecar& parsed) {
+bool DjlibService::sidecarChanged(const ParsedSidecar& parsed) {
     const DjlibSidecar& sidecar = parsed.sidecar;
     QString packageName = packageNameOf(parsed.sidecarName);
     if (!m_snapshot.contains(packageName) && m_snapshot.contains(sidecar.file)) {
@@ -921,39 +1076,37 @@ void DjlibService::sidecarChanged(const ParsedSidecar& parsed) {
         // left behind by an interrupted rename) isn't newer: ignore it.
         if (existing && existing->trackId.isValid() &&
                 sidecar.sidecarVersion <= existing->sidecarVersion) {
-            return;
+            return true;
         }
         if (existing) {
-            m_store.setPendingJson(sidecar.trackId, parsed.json);
-        } else {
-            DjlibStore::TrackState state;
-            state.djlibId = sidecar.trackId;
-            state.file = sidecar.file;
-            state.pendingJson = parsed.json;
-            m_store.upsertTrackState(state);
+            return m_store.setPendingJson(sidecar.trackId, parsed.json);
         }
-        return;
+        DjlibStore::TrackState state;
+        state.djlibId = sidecar.trackId;
+        state.file = sidecar.file;
+        state.pendingJson = parsed.json;
+        return m_store.upsertTrackState(state);
     }
     const QString path = QDir(tracksDir()).filePath(packageName);
     // Fast path (startup pass): nothing newer to apply and the mapped library
     // track still is this file (not moved), so no track needs loading.
     if (existing && existing->trackId.isValid() && !existing->pendingJson &&
             !m_deferred.contains(sidecar.trackId) &&
+            !m_unsaved.contains(sidecar.trackId) &&
             sidecar.sidecarVersion <= existing->sidecarVersion &&
             m_pTrackCollectionManager->internalCollection()
                             ->getTrackDAO()
                             .getTrackLocation(existing->trackId) ==
                     mixxx::FileInfo(path).location()) {
-        return;
+        return true;
     }
     if (existing && existing->trackId.isValid()) {
         relocateIfMoved(existing->trackId, path);
     }
-    const TrackPointer pTrack =
-            m_pTrackCollectionManager->getOrAddTrack(TrackRef::fromFilePath(path));
+    const TrackPointer pTrack = addTrack(path);
     if (!pTrack) {
         kLogger.warning() << "Cannot add" << path;
-        return;
+        return false;
     }
     if (existing && existing->trackId.isValid() && existing->trackId != pTrack->getId()) {
         // Couldn't relocate (old file still there, or the new file already
@@ -968,9 +1121,14 @@ void DjlibService::sidecarChanged(const ParsedSidecar& parsed) {
         state.appliedBeats.clear();
         state.appliedCues.clear();
         state.appliedKey.reset();
-        m_store.upsertTrackState(state);
+        m_unsaved.remove(sidecar.trackId);
+        m_deferred.remove(sidecar.trackId);
+        if (!m_store.upsertTrackState(state)) {
+            return false;
+        }
     }
-    applyToTrack(pTrack, sidecar);
+    applyToTrack(pTrack, sidecar, packageName);
+    return true;
 }
 
 void DjlibService::relocateIfMoved(TrackId trackId, const QString& newPath) {
@@ -1022,40 +1180,63 @@ void DjlibService::retry(const QString& djlibId) {
         m_deferred.remove(djlibId);
         return;
     }
-    applyToTrack(pTrack, deferred.sidecar);
+    applyToTrack(pTrack, deferred.sidecar, deferred.packageName);
 }
 
-void DjlibService::applyToTrack(const TrackPointer& pTrack, const DjlibSidecar& sidecar) {
+void DjlibService::applyToTrack(const TrackPointer& pTrack,
+        const DjlibSidecar& sidecar,
+        const QString& packageName) {
+    const QString& djlibId = sidecar.trackId;
+    const TrackId trackId = pTrack->getId();
     const bool loaded = isTrackLoaded(pTrack);
-    const auto result = m_importer.apply(pTrack, sidecar, m_store, loaded, allowedCrateIds());
-    if (m_pTrackCollectionManager->saveTrack(pTrack) ==
-            TrackCollectionManager::SaveTrackResult::Failed) {
-        kLogger.warning() << "Saving failed for" << sidecar.trackId;
+    // A row that could not be stored yet says what the track has now.
+    std::optional<DjlibStore::TrackState> existing;
+    const auto unsaved = m_unsaved.constFind(djlibId);
+    if (unsaved != m_unsaved.constEnd() && unsaved->state.trackId == trackId) {
+        existing = unsaved->state;
+    } else {
+        existing = m_store.trackState(djlibId);
     }
+    DjlibImporter::Baseline baseline;
+    const auto deferred = m_deferred.constFind(djlibId);
+    if (deferred != m_deferred.constEnd() && deferred->trackId == trackId) {
+        baseline = deferred->baseline;
+    }
+    const auto result = m_importer.prepare(
+            pTrack, sidecar, existing, loaded, allowedCrateIds(), baseline);
     if (result.outdated) {
-        m_deferred.remove(sidecar.trackId);
-        return;
+        m_deferred.remove(djlibId);
+        return; // a row not stored yet keeps waiting for its retry
     }
-    const auto state = m_store.trackState(sidecar.trackId);
-    if (state && state->pendingJson) {
-        m_store.setPendingJson(sidecar.trackId, std::nullopt);
+    Unsaved write;
+    write.pTrack = pTrack;
+    write.state = result.state;
+    // The name on disk (what the listing is compared with), not the
+    // sidecar's "file", which may be behind after a rename.
+    write.state.file = packageName;
+    write.state.pendingJson.reset();
+    if (!result.hasDeferred()) {
+        write.appliedVersion = sidecar.sidecarVersion;
+    }
+    // Save the track, then store the row; both again later if one failed.
+    m_unsaved.remove(djlibId);
+    if (!commit(djlibId, write)) {
+        m_unsaved.insert(djlibId, write);
+        scheduleWriteRetry();
     }
     if (result.hasDeferred()) {
         // Completed on deck unload (slotDeckTrackChanged) or after the probe.
-        m_deferred.insert(sidecar.trackId, Deferred{sidecar, pTrack->getId()});
+        m_deferred.insert(djlibId, Deferred{sidecar, trackId, packageName, result.baseline});
         if (result.needsSampleRate && !loaded) {
-            if (m_probed.contains(pTrack->getId())) {
-                kLogger.warning() << "Sample rate unknown for" << sidecar.trackId
+            if (m_probed.contains(trackId)) {
+                kLogger.warning() << "Sample rate unknown for" << djlibId
                                   << "- beats/cues wait for a deck load";
             } else {
                 startProbe(pTrack);
             }
         }
     } else {
-        m_deferred.remove(sidecar.trackId);
-        m_lastImport = QDateTime::currentDateTime();
-        m_lastImportFile = sidecar.file;
-        emit sidecarApplied(sidecar.trackId, sidecar.sidecarVersion);
+        m_deferred.remove(djlibId);
     }
 }
 
@@ -1091,6 +1272,7 @@ DjlibService::Status DjlibService::status() const {
     }
     status.waitingForPackage = m_store.countPending();
     status.deferred = static_cast<int>(m_deferred.size());
-    status.queued = static_cast<int>(m_queue.size()) + (m_passRunning ? 1 : 0) + m_jobsRunning;
+    status.queued = static_cast<int>(m_queue.size() + m_failedItems.size() + m_unsaved.size()) +
+            (m_passRunning ? 1 : 0) + m_jobsRunning;
     return status;
 }

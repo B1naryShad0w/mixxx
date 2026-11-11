@@ -61,6 +61,11 @@ struct ServiceTiming {
 /// while `fn(path)` returns true. Called on worker threads; may throw.
 void setReadFailureForTesting(std::function<bool(const QString& path)> fn);
 
+/// Tests only: makes a library write fail (as a busy database would) while
+/// `fn(what)` returns true; `what` is "save" (a track and its djlib state)
+/// or "add" (a new library track). Called on the main thread.
+void setWriteFailureForTesting(std::function<bool(const QString& what)> fn);
+
 /// A sidecar read and parsed on a worker thread.
 struct ParsedSidecar {
     QString sidecarName; // file name in <lib>/tracks
@@ -124,6 +129,11 @@ struct PassResult {
 ///   tracks/ dir is not "everything removed": the old snapshot is kept.
 /// - A file that can't be read (not: invalid) isn't recorded and is retried
 ///   with a backoff (1 s doubling to 60 s).
+/// - Library writes: the queue rests while the library scanner runs (it
+///   keeps the database locked). A sidecar's track is saved first and its
+///   `djlib_tracks` row stored only then; if either fails both are retried
+///   with the same backoff, and so is a track that could not be added.
+///   The row's `file` is the package's name on disk.
 /// - Beats/cues/key of a track loaded in a deck are deferred until the deck
 ///   unloads it (`slotDeckTrackChanged`); an unknown sample rate is probed on a
 ///   worker (`SoundSourceProxy::openAudioSource`) and the import completed.
@@ -150,7 +160,7 @@ class DjlibService : public QObject {
         QString problem;           // e.g. no tracks/ folder in the chosen path
         int waitingForPackage = 0; // sidecars without package
         int deferred = 0;          // waiting for a deck to unload / a sample rate
-        int queued = 0;            // queue items not processed yet
+        int queued = 0;            // queue items and writes not done yet
     };
 
     static const ConfigKey kLibraryPathKey; // [djlib] LibraryPath
@@ -226,11 +236,22 @@ class DjlibService : public QObject {
         QList<djlib::CrateRef> crates;
         QStringList crateIds;
         bool membershipsIncluded = false;
+        int attempts = 0; // failed so far
     };
 
     struct Deferred {
         DjlibSidecar sidecar;
         TrackId trackId;
+        QString packageName;
+        DjlibImporter::Baseline baseline;
+    };
+
+    /// An applied sidecar whose track or row could not be written yet. Holds
+    /// the track so the applied values stay in memory until they are saved.
+    struct Unsaved {
+        TrackPointer pTrack;
+        DjlibStore::TrackState state;
+        qint64 appliedVersion = 0; // > 0: announce as applied once written
     };
 
     void rearm();
@@ -244,15 +265,24 @@ class DjlibService : public QObject {
 
     void enqueue(Item item);
     void processNext();
-    void process(const Item& item);
+    bool process(const Item& item); // false: failed, try again later
+    void slotLibraryScanStarted();
+    void slotLibraryScanFinished();
+    void scheduleWriteRetry();
+    void slotWriteRetry();
+    bool commit(const QString& djlibId, const Unsaved& write);
+    void commitUnsaved();
+    TrackPointer addTrack(const QString& path);
     void reconcile(const QList<djlib::CrateRef>& crates, bool membershipsIncluded);
     void sweepMissingPackages();
     void relocateIfMoved(TrackId trackId, const QString& newPath);
-    void packageAdded(const QString& packageName);
-    void sidecarChanged(const djlib::ParsedSidecar& parsed);
+    bool packageAdded(const QString& packageName);
+    bool sidecarChanged(const djlib::ParsedSidecar& parsed);
     void applyMembership(const QString& djlibId, const QStringList& crateIds);
     void retry(const QString& djlibId);
-    void applyToTrack(const TrackPointer& pTrack, const DjlibSidecar& sidecar);
+    void applyToTrack(const TrackPointer& pTrack,
+            const DjlibSidecar& sidecar,
+            const QString& packageName);
     bool isTrackLoaded(const TrackPointer& pTrack) const;
     QSet<QString> allowedCrateIds() const;
     void scheduleReconcile();
@@ -279,6 +309,7 @@ class DjlibService : public QObject {
     QTimer m_safetyTimer;
     QTimer m_queueTimer;
     QTimer m_retryTimer;
+    QTimer m_writeRetryTimer;
     QElapsedTimer m_burst;
     QThreadPool m_pool;      // passes and membership jobs
     QThreadPool m_probePool; // sample-rate probes (never delay a pass)
@@ -291,6 +322,8 @@ class DjlibService : public QObject {
     bool m_tracksDirMissing = false;
     bool m_libraryDirMissing = false;
     int m_retryDelayMillis = 0;
+    int m_writeRetryDelayMillis = 0;
+    bool m_scanRunning = false; // library scan: no library writes meanwhile
     bool m_sweepNeeded = false; // first pass after rearm, or names were lost
     QElapsedTimer m_emptySince; // tracks/ listed empty while rows are mapped
     QTimer m_confirmTimer;
@@ -302,6 +335,8 @@ class DjlibService : public QObject {
     std::optional<QList<djlib::CrateRef>> m_crates; // last valid crates.json
 
     QQueue<Item> m_queue;
+    QList<Item> m_failedItems;         // re-queued by m_writeRetryTimer
+    QHash<QString, Unsaved> m_unsaved; // djlib id -> write to repeat
     QHash<QString, Deferred> m_deferred; // djlib id -> sidecar
     QSet<TrackId> m_probing;
     QSet<TrackId> m_probed;
