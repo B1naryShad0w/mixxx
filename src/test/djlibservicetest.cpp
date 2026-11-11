@@ -276,7 +276,7 @@ TEST_F(DjlibServiceTest, tmpFilesAreIgnored) {
     writeCrates({"crate_a"});
     startService();
 
-    // Names containing ".tmp" anywhere, as left over by an interrupted agent.
+    // Temp names ("<target>.tmp<digits>"), as left over by an interrupted agent.
     ASSERT_TRUE(QFile::copy(getTestDir().filePath(kAlacStem),
             tracksPath(packageName(1) + QStringLiteral(".tmp"))));
     ASSERT_TRUE(QFile::copy(getTestDir().filePath(kAlacStem),
@@ -297,6 +297,65 @@ TEST_F(DjlibServiceTest, tmpFilesAreIgnored) {
     EXPECT_FALSE(m_pService->store().trackState(djlibId(1)));
     EXPECT_FALSE(trackByPath(tracksPath(packageName(1) + QStringLiteral(".tmp"))));
     EXPECT_FALSE(trackByPath(tracksPath(QStringLiteral("x.tmp1.stem.mp4"))));
+}
+
+TEST_F(DjlibServiceTest, titleContainingTmpIsAnOrdinaryTrack) {
+    writeCrates({"crate_a"});
+    startService();
+    // ".tmp" inside a title is not a temp file.
+    const QString package = QStringLiteral("Artist - Song.tmp edit [10000001].stem.mp4");
+    const QString sidecar = QStringLiteral("Artist - Song.tmp edit [10000001].djlib.json");
+    ASSERT_TRUE(copyByRename(getTestDir().filePath(kAlacStem), tracksPath(package)));
+    auto json = sidecarJson(1, 1, crateRefs({"crate_a"}));
+    json["file"] = package;
+    ASSERT_TRUE(writeByRename(tracksPath(sidecar), QJsonDocument(json).toJson()));
+    ASSERT_TRUE(QTest::qWaitFor(
+            [&] {
+                const auto state = m_pService->store().trackState(djlibId(1));
+                return state && state->sidecarVersion == 1;
+            },
+            kTimeoutMillis));
+    const auto pTrack = trackByPath(tracksPath(package));
+    ASSERT_TRUE(pTrack);
+    EXPECT_EQ(QStringList{"crate_a"}, managedCratesOf(pTrack->getId()));
+}
+
+TEST_F(DjlibServiceTest, hugeSidecarIsRejectedNotRead) {
+    writeCrates({"crate_a"});
+    startService();
+    writePackage(1);
+    {
+        // A valid sidecar padded far beyond the size limit.
+        QFile file(tracksPath(sidecarName(1)));
+        ASSERT_TRUE(file.open(QIODevice::WriteOnly));
+        QByteArray json = QJsonDocument(sidecarJson(1, 1, crateRefs({"crate_a"}))).toJson();
+        json.append(QByteArray(djlib::kMaxJsonBytes, ' '));
+        file.write(json);
+    }
+    writePackage(2);
+    writeSidecar(2, 1, {"crate_a"});
+    ASSERT_TRUE(QTest::qWaitFor([this] { return hasDjlibBeats(2); }, kTimeoutMillis));
+    ASSERT_TRUE(waitIdle());
+    EXPECT_FALSE(m_pService->store().trackState(djlibId(1)));
+    EXPECT_FALSE(hasDjlibBeats(1));
+}
+
+TEST_F(DjlibServiceTest, passThatThrowsIsRetried) {
+    writeCrates({"crate_a"});
+    writePackage(1);
+    writeSidecar(1, 1, {"crate_a"});
+    auto pThrown = std::make_shared<std::atomic<int>>(0);
+    djlib::setReadFailureForTesting([pThrown](const QString& path) -> bool {
+        if (path.endsWith(sidecarName(1)) && pThrown->fetch_add(1) < 1) {
+            throw std::bad_alloc();
+        }
+        return false;
+    });
+    startService();
+    // The failed pass must not leave the service waiting for it forever.
+    ASSERT_TRUE(QTest::qWaitFor([this] { return hasDjlibBeats(1); }, kTimeoutMillis));
+    EXPECT_GE(pThrown->load(), 2);
+    ASSERT_TRUE(waitIdle());
 }
 
 TEST_F(DjlibServiceTest, burstOf200SidecarsIsAppliedOnceEach) {

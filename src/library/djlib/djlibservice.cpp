@@ -3,6 +3,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QRegularExpression>
 #include <QSqlQuery>
 #include <QStandardPaths>
 #include <QtConcurrent>
@@ -47,10 +48,19 @@ bool isSidecarName(const QString& name) {
     return name.endsWith(kSidecarSuffix, Qt::CaseInsensitive);
 }
 
+/// A temp file of the agent ("<target>.tmp<digits>") or a file named after
+/// one. Only a whole ".tmp<digits>" name component counts: a title like
+/// "Song.tmp edit" is an ordinary track.
+bool isTempName(const QString& name) {
+    static const QRegularExpression kTempComponent(
+            QStringLiteral("\\.tmp[0-9]*(\\.|$)"),
+            QRegularExpression::CaseInsensitiveOption);
+    return kTempComponent.match(name).hasMatch();
+}
+
 /// Only packages and sidecars; never temp files of the agent.
 bool isWatchedName(const QString& name) {
-    return !name.contains(QStringLiteral(".tmp"), Qt::CaseInsensitive) &&
-            (isPackageName(name) || isSidecarName(name));
+    return (isPackageName(name) || isSidecarName(name)) && !isTempName(name);
 }
 
 QString packageNameOf(const QString& sidecarName) {
@@ -65,7 +75,9 @@ FileStamp stampOf(const QFileInfo& info) {
     return FileStamp{info.size(), info.lastModified().toMSecsSinceEpoch()};
 }
 
-/// Reads a whole small file; the handle is closed before returning.
+/// Reads a whole small file; the handle is closed before returning. Never
+/// more than one byte over `djlib::kMaxJsonBytes` (the parsers reject that
+/// as too large), whatever size the file has.
 std::optional<QByteArray> readFile(const QString& path) {
     if (s_readFailureForTesting && s_readFailureForTesting(path)) {
         return std::nullopt;
@@ -74,7 +86,7 @@ std::optional<QByteArray> readFile(const QString& path) {
     if (!file.open(QIODevice::ReadOnly)) {
         return std::nullopt;
     }
-    return file.readAll();
+    return file.read(djlib::kMaxJsonBytes + 1);
 }
 
 enum class ReadResult {
@@ -128,7 +140,7 @@ SidecarCrates cratesOf(const DjlibSidecar& sidecar) {
 
 /// The crates of every sidecar whose package is present (all of them, or only
 /// those listing one of `onlyCrateIds`). `known`: sidecars already parsed.
-QList<SidecarCrates> collectMemberships(const QString& tracksDir,
+QList<SidecarCrates> collectMembershipsUnguarded(const QString& tracksDir,
         const QHash<QString, FileStamp>& snapshot,
         const QSet<QString>& onlyCrateIds,
         const QHash<QString, SidecarCrates>& known,
@@ -164,9 +176,25 @@ QList<SidecarCrates> collectMemberships(const QString& tracksDir,
     return result;
 }
 
+/// Worker jobs must always deliver a result: an exception (out of memory on
+/// a broken file, ...) lost in the thread pool would leave the service
+/// waiting for the job forever.
+QList<SidecarCrates> collectMemberships(const QString& tracksDir,
+        const QHash<QString, FileStamp>& snapshot,
+        const QSet<QString>& onlyCrateIds,
+        const QHash<QString, SidecarCrates>& known,
+        const std::shared_ptr<std::atomic<bool>>& pStopping) {
+    try {
+        return collectMembershipsUnguarded(tracksDir, snapshot, onlyCrateIds, known, pStopping);
+    } catch (...) {
+        kLogger.warning() << "Reading the sidecars in" << tracksDir << "failed";
+        return {};
+    }
+}
+
 /// One pass on a worker thread: list, diff against `snapshot`, read and parse
 /// what changed. Touches no library state.
-PassResult runPass(quint64 generation,
+PassResult runPassUnguarded(quint64 generation,
         const QString& tracksDir,
         const QString& cratesPath,
         const QHash<QString, FileStamp>& snapshot,
@@ -262,10 +290,32 @@ PassResult runPass(quint64 generation,
         }
     }
     if (result.crates) {
-        result.memberships =
-                collectMemberships(tracksDir, result.snapshot, {}, known, pStopping);
+        result.memberships = collectMembershipsUnguarded(
+                tracksDir, result.snapshot, {}, known, pStopping);
     }
     return result;
+}
+
+PassResult runPass(quint64 generation,
+        const QString& tracksDir,
+        const QString& cratesPath,
+        const QHash<QString, FileStamp>& snapshot,
+        const std::optional<FileStamp>& cratesStamp,
+        const std::shared_ptr<std::atomic<bool>>& pStopping) {
+    try {
+        return runPassUnguarded(generation,
+                tracksDir,
+                cratesPath,
+                snapshot,
+                cratesStamp,
+                pStopping);
+    } catch (...) {
+        kLogger.warning() << "The pass over" << tracksDir << "failed - retrying later";
+        PassResult result;
+        result.generation = generation;
+        result.failed = true;
+        return result;
+    }
 }
 
 } // namespace
@@ -350,6 +400,9 @@ DjlibService::~DjlibService() {
     }
     m_generation++;
     m_pStopping->store(true); // running passes stop reading sidecars
+    // Probes not started yet are dropped, the running one is waited for
+    // (one decoder open; it can't be interrupted).
+    m_probePool.clear();
     m_pool.waitForDone();
     m_probePool.waitForDone();
 }
@@ -535,7 +588,13 @@ void DjlibService::startPass() {
 
 void DjlibService::onPassFinished(PassResult result) {
     m_passRunning = false;
-    if (result.generation == m_generation) {
+    if (result.generation == m_generation && result.failed) {
+        // Nothing learned: keep the snapshot and try again with the backoff.
+        m_retryDelayMillis = m_retryDelayMillis == 0
+                ? m_timing.retryMinMillis
+                : std::min(2 * m_retryDelayMillis, m_timing.retryMaxMillis);
+        m_retryTimer.start(m_retryDelayMillis);
+    } else if (result.generation == m_generation) {
         if (result.tracksDirOk == m_tracksDirMissing) {
             m_tracksDirMissing = !result.tracksDirOk;
             if (m_tracksDirMissing) {
@@ -639,8 +698,15 @@ void DjlibService::startProbe(const TrackPointer& pTrack) {
     // Opens the audio source once to read the stream info (sample rate), as
     // AnalyzerThread does. The source is closed again right away.
     QtConcurrent::run(&m_probePool,
-            [pTrack] {
-                SoundSourceProxy(pTrack).openAudioSource();
+            [pTrack, pStopping = m_pStopping] {
+                if (pStopping->load()) {
+                    return;
+                }
+                try {
+                    SoundSourceProxy(pTrack).openAudioSource();
+                } catch (...) {
+                    kLogger.warning() << "Probing" << pTrack->getLocation() << "failed";
+                }
             })
             .then(this, [this, trackId] {
                 --m_jobsRunning;

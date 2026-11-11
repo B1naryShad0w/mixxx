@@ -53,7 +53,7 @@ struct ServiceTiming {
 };
 
 /// Tests only: makes reading `path` fail (as a sharing violation would)
-/// while `fn(path)` returns true. Called on worker threads.
+/// while `fn(path)` returns true. Called on worker threads; may throw.
 void setReadFailureForTesting(std::function<bool(const QString& path)> fn);
 
 /// A sidecar read and parsed on a worker thread.
@@ -72,6 +72,7 @@ struct SidecarCrates {
 /// Result of one directory pass, computed on a worker thread.
 struct PassResult {
     quint64 generation = 0;
+    bool failed = false; // the pass threw: nothing below is set
     // false: tracks/ missing or unreadable; `snapshot` is the old one then
     // and nothing counts as removed.
     bool tracksDirOk = false;
@@ -97,7 +98,8 @@ struct PassResult {
 ///   (name -> size, mtime) on a worker thread; new/changed sidecars (and the
 ///   sidecars of new/changed packages) and crates.json are read and parsed
 ///   there too. Only `*.stem.mp4` and `*.djlib.json` are considered; names
-///   containing ".tmp" are ignored. Files are only stat'ed and read, never
+///   with a ".tmp<digits>" component (the agent's temp files) are ignored.
+///   Files are only stat'ed and read (at most `djlib::kMaxJsonBytes`), never
 ///   held open or changed.
 /// - The results go into a queue that is processed on the main thread, one
 ///   item per event-loop turn (library, DAO, crates and own SQL are main-thread
