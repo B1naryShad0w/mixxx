@@ -89,6 +89,15 @@ struct AgentLibrary {
 };
 AgentLibrary readAgentLibraryFile(const QString& path);
 
+/// True if the agent itself says that the library in `libraryPath` holds no
+/// track: its `library.json` (`agentLibraryFile`) names that folder and its
+/// `state.json` next to it, written after every sync, lists no tracks after
+/// at least one sync with the server (`{"last_seq":N,"tracks":{}}`, N > 0).
+/// An empty `tracks/` is then what the agent made of it (all tracks removed
+/// on the server and the removal confirmed), not a folder being recreated
+/// or a failed listing. False whenever that can't be told.
+bool agentLibraryIsEmpty(const QString& agentLibraryFile, const QString& libraryPath);
+
 /// A sidecar read and parsed on a worker thread.
 struct ParsedSidecar {
     QString sidecarName; // file name in <lib>/tracks
@@ -121,6 +130,9 @@ struct PassResult {
     QList<SidecarCrates> memberships; // all sidecars with a package, iff crates changed
     bool lostNames = false;           // a package of the old snapshot is gone
     QStringList readFailures;         // not in the snapshot/stamp: retried
+    // No package listed, and the agent says that this is right (see
+    // agentLibraryIsEmpty()).
+    bool agentSaysEmpty = false;
 };
 
 } // namespace djlib
@@ -406,6 +418,7 @@ class DjlibService : public QObject {
     QElapsedTimer m_cratesEmptySince; // crates.json empty while crates are managed
     QTimer m_confirmTimer;
     int m_packageCount = 0;
+    bool m_agentSaysEmpty = false; // of the last pass
     std::shared_ptr<std::atomic<bool>> m_pStopping;
 
     QHash<QString, djlib::FileStamp> m_snapshot;

@@ -167,6 +167,22 @@ class DjlibServiceTest : public LibraryTest {
         ASSERT_TRUE(writeByRename(agentFilePath(), QJsonDocument(json).toJson()));
     }
 
+    /// As the agent does after every sync (its state.json, next to
+    /// library.json): no tracks, or one.
+    void writeAgentState(int lastSeq, bool withTrack = false) {
+        ASSERT_TRUE(QDir().mkpath(QFileInfo(agentFilePath()).absolutePath()));
+        QJsonObject tracks;
+        if (withTrack) {
+            tracks.insert(djlibId(1), QJsonObject{{"id", djlibId(1)}, {"file", packageName(1)}});
+        }
+        const QJsonObject json{{"last_seq", lastSeq}, {"tracks", tracks}};
+        ASSERT_TRUE(writeByRename(agentStatePath(), QJsonDocument(json).toJson()));
+    }
+
+    QString agentStatePath() const {
+        return QFileInfo(agentFilePath()).absoluteDir().filePath(QStringLiteral("state.json"));
+    }
+
     void startService() {
         createService();
         m_pService->setLibraryPath(m_libPath);
@@ -1097,6 +1113,129 @@ TEST_F(DjlibServiceTest, removalWhileClosedDropsCrates) {
             kTimeoutMillis));
     EXPECT_TRUE(trackCollectionManager()->getTrackById(trackId));
     EXPECT_TRUE(m_pService->store().crateMapping("crate_a"));
+}
+
+TEST_F(DjlibServiceTest, lastRemovalWhileClosedDropsCratesAtOnceWhenTheAgentHasNoTracks) {
+    m_emptyConfirmMillis = 60000; // as in Mixxx: far longer than this test
+    writeCrates({"crate_a"});
+    startService();
+    writePackage(1);
+    writeSidecar(1, 1, {"crate_a"});
+    ASSERT_TRUE(QTest::qWaitFor([this] { return hasDjlibBeats(1); }, kTimeoutMillis));
+    const TrackId trackId = track(1)->getId();
+    stopService();
+
+    // All tracks left the crates on the server and the removal was
+    // confirmed in the agent: tracks/ is empty, and so is the agent's record.
+    ASSERT_TRUE(QDir(m_libPath).mkpath(QStringLiteral("_removed")));
+    ASSERT_TRUE(QFile::rename(tracksPath(packageName(1)),
+            QDir(m_libPath).filePath(QStringLiteral("_removed/") + packageName(1))));
+    ASSERT_TRUE(QFile::rename(tracksPath(sidecarName(1)),
+            QDir(m_libPath).filePath(QStringLiteral("_removed/") + sidecarName(1))));
+    writeAgentFile(m_libPath);
+    writeAgentState(7);
+
+    startServiceFromConfig();
+    ASSERT_TRUE(QTest::qWaitFor(
+            [this, trackId] { return managedCratesOf(trackId).isEmpty(); },
+            kTimeoutMillis));
+    ASSERT_TRUE(waitIdle());
+    EXPECT_TRUE(trackCollectionManager()->getTrackById(trackId));
+    EXPECT_TRUE(m_pService->store().crateMapping("crate_a"));
+    EXPECT_EQ(-1, m_pService->store().trackState(djlibId(1))->sidecarVersion);
+}
+
+TEST_F(DjlibServiceTest, emptyLibraryRemovesTheCratesAtOnceWhenTheAgentHasNoTracks) {
+    m_emptyConfirmMillis = 60000;
+    writeCrates({"crate_a"});
+    startService();
+    writePackage(1);
+    writeSidecar(1, 1, {"crate_a"});
+    ASSERT_TRUE(QTest::qWaitFor([this] { return hasDjlibBeats(1); }, kTimeoutMillis));
+    const TrackId trackId = track(1)->getId();
+    stopService();
+
+    // The last crate was deleted on the server too.
+    ASSERT_TRUE(QFile::remove(tracksPath(packageName(1))));
+    ASSERT_TRUE(QFile::remove(tracksPath(sidecarName(1))));
+    writeCrates({});
+    writeAgentFile(m_libPath);
+    writeAgentState(7);
+
+    startServiceFromConfig();
+    ASSERT_TRUE(QTest::qWaitFor(
+            [this] { return !m_pService->store().crateMapping("crate_a"); },
+            kTimeoutMillis));
+    ASSERT_TRUE(waitIdle());
+    EXPECT_TRUE(managedCratesOf(trackId).isEmpty());
+    EXPECT_TRUE(trackCollectionManager()->getTrackById(trackId));
+}
+
+TEST_F(DjlibServiceTest, emptyTracksDirStillWaitsWhenTheAgentKnowsTracks) {
+    m_emptyConfirmMillis = 60000;
+    writeCrates({"crate_a"});
+    startService();
+    writePackage(1);
+    writeSidecar(1, 1, {"crate_a"});
+    ASSERT_TRUE(QTest::qWaitFor([this] { return hasDjlibBeats(1); }, kTimeoutMillis));
+    const TrackId trackId = track(1)->getId();
+    stopService();
+
+    // tracks/ is empty, but not by the agent's doing: it still has the track.
+    QTemporaryDir away;
+    ASSERT_TRUE(QFile::rename(tracksPath(packageName(1)), away.filePath(packageName(1))));
+    ASSERT_TRUE(QFile::rename(tracksPath(sidecarName(1)), away.filePath(sidecarName(1))));
+    writeAgentFile(m_libPath);
+    writeAgentState(7, true);
+
+    startServiceFromConfig();
+    QTest::qWait(1000);
+    ASSERT_TRUE(waitIdle());
+    EXPECT_EQ(QStringList{"crate_a"}, managedCratesOf(trackId));
+}
+
+TEST_F(DjlibServiceTest, agentLibraryIsOnlyEmptyWhenTheAgentSaysSo) {
+    const QString agentFile = agentFilePath();
+    // No agent at all.
+    EXPECT_FALSE(djlib::agentLibraryIsEmpty(agentFile, m_libPath));
+    // No state yet.
+    writeAgentFile(m_libPath);
+    EXPECT_FALSE(djlib::agentLibraryIsEmpty(agentFile, m_libPath));
+
+    writeAgentState(7);
+    EXPECT_TRUE(djlib::agentLibraryIsEmpty(agentFile, m_libPath));
+    EXPECT_TRUE(djlib::agentLibraryIsEmpty(agentFile, m_libPath + QStringLiteral("/")));
+    // Another folder than the agent's.
+    QTemporaryDir other;
+    EXPECT_FALSE(djlib::agentLibraryIsEmpty(agentFile, other.path()));
+    EXPECT_FALSE(djlib::agentLibraryIsEmpty(agentFile, QString()));
+    EXPECT_FALSE(djlib::agentLibraryIsEmpty(QString(), m_libPath));
+
+    // Never synced (a fresh or lost state), tracks known, other content.
+    writeAgentState(0);
+    EXPECT_FALSE(djlib::agentLibraryIsEmpty(agentFile, m_libPath));
+    writeAgentState(7, true);
+    EXPECT_FALSE(djlib::agentLibraryIsEmpty(agentFile, m_libPath));
+    const QList<QByteArray> invalid{
+            QByteArray(),
+            QByteArrayLiteral("{\"last_seq\":7,\"tracks\":{}"),
+            QByteArrayLiteral("[]"),
+            QByteArrayLiteral("{\"last_seq\":7}"),
+            QByteArrayLiteral("{\"last_seq\":7,\"tracks\":null}"),
+            QByteArrayLiteral("{\"last_seq\":7,\"tracks\":[]}"),
+            QByteArrayLiteral("{\"last_seq\":\"7\",\"tracks\":{}}"),
+            QByteArrayLiteral("{\"tracks\":{}}"),
+            QByteArrayLiteral("{\"last_seq\":7,\"tracks\":{}}") + QByteArray(8192, ' '),
+    };
+    for (const auto& json : invalid) {
+        ASSERT_TRUE(writeByRename(agentStatePath(), json));
+        EXPECT_FALSE(djlib::agentLibraryIsEmpty(agentFile, m_libPath)) << json.left(60).toStdString();
+    }
+
+    // The agent moved on to another library.
+    writeAgentState(7);
+    writeAgentFile(other.path());
+    EXPECT_FALSE(djlib::agentLibraryIsEmpty(agentFile, m_libPath));
 }
 
 TEST_F(DjlibServiceTest, renameWhileClosedRelocatesAndKeepsDjEdits) {

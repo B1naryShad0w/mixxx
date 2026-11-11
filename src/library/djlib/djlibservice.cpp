@@ -53,6 +53,11 @@ constexpr int kMaxItemAttempts = 10;
 /// The agent's library.json is a few hundred bytes.
 constexpr qint64 kMaxAgentLibraryBytes = 64 * 1024;
 
+/// The agent's state.json next to its library.json. Without tracks it is a
+/// few dozen bytes; a larger one is not read at all.
+const QString kAgentStateFile = QStringLiteral("state.json");
+constexpr qint64 kMaxEmptyAgentStateBytes = 4 * 1024;
+
 /// A package whose sample rate can't be read (still being written, locked
 /// by a scanner) is opened again with the safety passes, this often at most
 /// until the package changes.
@@ -236,6 +241,7 @@ QList<SidecarCrates> collectMemberships(const QString& tracksDir,
 /// what changed. Touches no library state.
 PassResult runPassUnguarded(quint64 generation,
         const QString& libraryPath,
+        const QString& agentLibraryFile,
         const QHash<QString, FileStamp>& snapshot,
         const std::optional<FileStamp>& cratesStamp,
         const std::shared_ptr<std::atomic<bool>>& pStopping) {
@@ -257,6 +263,12 @@ PassResult runPassUnguarded(quint64 generation,
     if (pStopping->load()) {
         return result;
     }
+    // Only asked when it matters: nothing is listed.
+    result.agentSaysEmpty = result.tracksDirOk &&
+            std::none_of(result.snapshot.keyBegin(),
+                    result.snapshot.keyEnd(),
+                    [](const QString& name) { return isPackageName(name); }) &&
+            djlib::agentLibraryIsEmpty(agentLibraryFile, libraryPath);
 
     result.cratesStamp = cratesStamp;
     const QFileInfo cratesInfo(cratesPath);
@@ -371,11 +383,17 @@ PassResult runPassUnguarded(quint64 generation,
 
 PassResult runPass(quint64 generation,
         const QString& libraryPath,
+        const QString& agentLibraryFile,
         const QHash<QString, FileStamp>& snapshot,
         const std::optional<FileStamp>& cratesStamp,
         const std::shared_ptr<std::atomic<bool>>& pStopping) {
     try {
-        return runPassUnguarded(generation, libraryPath, snapshot, cratesStamp, pStopping);
+        return runPassUnguarded(generation,
+                libraryPath,
+                agentLibraryFile,
+                snapshot,
+                cratesStamp,
+                pStopping);
     } catch (...) {
         kLogger.warning() << "The pass over" << libraryPath << "failed - retrying later";
         PassResult result;
@@ -534,6 +552,40 @@ djlib::AgentLibrary djlib::readAgentLibraryFile(const QString& path) {
     result.libraryDir = QDir::cleanPath(dir);
     result.state = AgentLibrary::State::Found;
     return result;
+}
+
+bool djlib::agentLibraryIsEmpty(const QString& agentLibraryFile, const QString& libraryPath) {
+    if (agentLibraryFile.isEmpty() || libraryPath.isEmpty()) {
+        return false;
+    }
+    // The agent may sync another folder than the one chosen here.
+    const AgentLibrary agent = readAgentLibraryFile(agentLibraryFile);
+    if (agent.state != AgentLibrary::State::Found) {
+        return false;
+    }
+    const QString canonical = QFileInfo(libraryPath).canonicalFilePath();
+    if (!samePath(agent.libraryDir, libraryPath) &&
+            (canonical.isEmpty() ||
+                    !samePath(QFileInfo(agent.libraryDir).canonicalFilePath(), canonical))) {
+        return false;
+    }
+    QFile file(QFileInfo(agentLibraryFile).absoluteDir().filePath(kAgentStateFile));
+    if (!file.open(QIODevice::ReadOnly)) {
+        return false;
+    }
+    const QByteArray json = file.read(kMaxEmptyAgentStateBytes + 1);
+    if (json.size() > kMaxEmptyAgentStateBytes) {
+        return false;
+    }
+    QJsonParseError error;
+    const QJsonDocument document = QJsonDocument::fromJson(json, &error);
+    if (error.error != QJsonParseError::NoError || !document.isObject()) {
+        return false;
+    }
+    const QJsonValue lastSeq = document.object().value(QLatin1String("last_seq"));
+    const QJsonValue tracks = document.object().value(QLatin1String("tracks"));
+    return lastSeq.isDouble() && lastSeq.toDouble() > 0 &&
+            tracks.isObject() && tracks.toObject().isEmpty();
 }
 
 void djlib::setReadFailureForTesting(std::function<bool(const QString& path)> fn) {
@@ -824,6 +876,7 @@ void DjlibService::startPass() {
             runPass,
             m_generation,
             m_libraryPath,
+            m_agentLibraryFile,
             m_snapshot,
             m_cratesStamp,
             m_pStopping)
@@ -871,11 +924,14 @@ void DjlibService::onPassFinished(PassResult result) {
         }
         m_passRequested |= newlyWatched;
         m_snapshot = std::move(result.snapshot);
+        m_agentSaysEmpty = result.agentSaysEmpty;
         // A valid crates.json without crates would delete every managed
         // crate and with them all memberships. The agent never writes that
         // while a library has crates, so it is only believed when it still
-        // says so a while later (as for an empty tracks/).
-        if (result.crates && result.crates->isEmpty() && !m_store.crateMappings().isEmpty()) {
+        // says so a while later (as for an empty tracks/), or at once when
+        // the agent's own record has no tracks either.
+        if (result.crates && result.crates->isEmpty() &&
+                !m_store.crateMappings().isEmpty() && !m_agentSaysEmpty) {
             if (!m_cratesEmptySince.isValid()) {
                 kLogger.warning() << QDir(djlibDir()).filePath(kCratesFile)
                                   << "lists no crates - keeping the djlib crates for now";
@@ -1264,8 +1320,11 @@ bool DjlibService::sweepMissingPackages() {
         return ok;
     }
     // An existing but empty tracks/ (agent recreating it, a failed listing)
-    // only counts once it is still empty a while later.
-    if (m_packageCount == 0) {
+    // only counts once it is still empty a while later, or at once when the
+    // agent's own record has no tracks either (all removed on the server).
+    if (m_packageCount == 0 && m_agentSaysEmpty) {
+        kLogger.info() << tracksDir() << "is empty, as the djlib agent says it should be";
+    } else if (m_packageCount == 0) {
         if (!m_emptySince.isValid()) {
             kLogger.warning() << tracksDir() << "is empty - keeping the djlib crates for now";
             m_emptySince.start();
