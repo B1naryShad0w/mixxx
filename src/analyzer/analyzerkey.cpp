@@ -227,6 +227,12 @@ void AnalyzerKey::storeResults(TrackPointer tio) {
         return;
     }
 
+    // djlib fork: a key imported from a djlib sidecar while this analysis
+    // was running is final too (see shouldAnalyze()).
+    if (tio->getKeys().getSubVersion() == QLatin1String("djlib/1")) {
+        return;
+    }
+
     KeyChangeList key_changes = m_pPlugin->getKeyChanges();
     QHash<QString, QString> extraVersionInfo = getExtraVersionInfo(
             m_pluginId, m_bPreferencesFastAnalysisEnabled);

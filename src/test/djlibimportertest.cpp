@@ -639,6 +639,28 @@ TEST_F(DjlibAnalyzerKeyGuardTest, djlibKeyIsNotReanalyzed) {
     EXPECT_FALSE(keyAnalyzerWouldRun());
 }
 
+TEST_F(DjlibAnalyzerKeyGuardTest, keyImportedDuringAnalysisIsNotOverwritten) {
+    // The analysis starts on a track without key ...
+    KeyDetectionSettings settings(config());
+    AnalyzerKey analyzer(settings);
+    const SINT kFrames = 44100;
+    ASSERT_TRUE(analyzer.initialize(AnalyzerTrack(m_pTrack),
+            mixxx::audio::SampleRate(44100),
+            mixxx::audio::ChannelCount(2),
+            kFrames));
+    // ... the sidecar arrives while it runs ...
+    apply(sidecarJson(1));
+    ASSERT_EQ(DjlibImporter::kKeySubVersion, m_pTrack->getKeys().getSubVersion());
+    const auto key = m_pTrack->getKey();
+    // ... and the analysis finishes.
+    const std::vector<CSAMPLE> samples(kFrames * 2, 0.0f);
+    ASSERT_TRUE(analyzer.processSamples(samples.data(), static_cast<SINT>(samples.size())));
+    analyzer.storeResults(m_pTrack);
+    analyzer.cleanup();
+    EXPECT_EQ(DjlibImporter::kKeySubVersion, m_pTrack->getKeys().getSubVersion());
+    EXPECT_EQ(key, m_pTrack->getKey());
+}
+
 TEST_F(DjlibAnalyzerKeyGuardTest, otherKeysBehaveAsUpstream) {
     // An outdated analyzer key and an ordinary file-tag key are re-analysed
     // with ReanalyzeWhenSettingsChange, as in stock Mixxx.
