@@ -2,6 +2,7 @@
 
 #include <utility>
 
+#include "library/djlib/djlibprotect.h"
 #include "library/externaltrackcollection.h"
 #include "library/library_decl.h"
 #include "library/library_prefs.h"
@@ -296,6 +297,13 @@ ExportTrackMetadataResult TrackCollectionManager::exportTrackMetadataBeforeSavin
         Track* pTrack,
         TrackMetadataExportMode mode) const {
     VERIFY_OR_DEBUG_ASSERT(pTrack) {
+        return ExportTrackMetadataResult::Skipped;
+    }
+
+    // djlib fork: files in the djlib library folder belong to the agent
+    // and are never modified, neither on request nor by the preference.
+    if (djlib::isProtectedFile(pTrack->getLocation()) ||
+            djlib::isProtectedFile(pTrack->getFileInfo().canonicalLocation())) {
         return ExportTrackMetadataResult::Skipped;
     }
 

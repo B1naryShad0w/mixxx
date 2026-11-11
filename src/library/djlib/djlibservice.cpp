@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <utility>
 
+#include "library/djlib/djlibprotect.h"
 #include "library/trackcollection.h"
 #include "library/trackcollectionmanager.h"
 #include "moc_djlibservice.cpp"
@@ -235,6 +236,7 @@ PassResult runPassUnguarded(quint64 generation,
     PassResult result;
     result.generation = generation;
     result.libraryDirOk = QFileInfo(libraryPath).isDir();
+    result.canonicalLibraryPath = QFileInfo(libraryPath).canonicalFilePath();
     result.djlibDirOk = QFileInfo(djlibDir).isDir();
     result.tracksDirOk = isUsableDir(tracksDir);
     // A missing/unreadable dir (unplugged drive, dropped share) is not
@@ -466,6 +468,7 @@ DjlibService::~DjlibService() {
     }
     m_generation++;
     commitUnsaved(); // last chance: the tracks themselves are saved on exit
+    djlib::setProtectedRoots({});
     m_pStopping->store(true); // running passes stop reading sidecars
     // Probes not started yet are dropped, the running one is waited for
     // (one decoder open; it can't be interrupted).
@@ -570,6 +573,10 @@ void DjlibService::rearm() {
     m_unsaved.clear();
     m_failedItems.clear();
     m_probed.clear();
+    // Nothing in the library folder is ever modified (no tag export).
+    djlib::setProtectedRoots(m_libraryPath.isEmpty()
+                    ? QStringList()
+                    : QStringList{QDir(m_libraryPath).absolutePath()});
     m_tracksDirMissing = false;
     m_libraryDirMissing = false;
     m_confirmTimer.stop();
@@ -680,6 +687,9 @@ void DjlibService::onPassFinished(PassResult result) {
             }
         }
         m_libraryDirMissing = !result.libraryDirOk;
+        // Tracks may be known by their canonical location too.
+        djlib::setProtectedRoots({QDir(m_libraryPath).absolutePath(),
+                result.canonicalLibraryPath});
         // Directories may only appear with the first sync. Something may
         // have changed between the listing and the watch: look once more.
         bool newlyWatched = false;

@@ -1476,6 +1476,7 @@ add_library(
   src/library/dao/trackschema.cpp
   src/library/djlib/djlibcratesync.cpp
   src/library/djlib/djlibimporter.cpp
+  src/library/djlib/djlibprotect.cpp
   src/library/djlib/djlibservice.cpp
   src/library/djlib/djlibsidecar.cpp
   src/library/djlib/djlibstore.cpp

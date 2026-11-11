@@ -92,6 +92,7 @@ struct PassResult {
     // and nothing counts as removed.
     bool tracksDirOk = false;
     bool libraryDirOk = false; // the library folder exists
+    QString canonicalLibraryPath; // symlinks resolved; empty if it is missing
     bool djlibDirOk = false;   // <lib>/_djlib exists
     QHash<QString, FileStamp> snapshot; // name -> stamp, filtered names only
     std::optional<FileStamp> cratesStamp;

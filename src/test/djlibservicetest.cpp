@@ -20,6 +20,7 @@
 #include "library/djlib/djlibservice.h"
 #include "library/djlib/djlibstore.h"
 #include "library/djlib/dlgprefdjlib.h"
+#include "library/library_prefs.h"
 #include "library/trackset/crate/crate.h"
 #include "proto/keys.pb.h" // needed by keydetectionsettings.h
 #include "preferences/keydetectionsettings.h"
@@ -600,6 +601,60 @@ TEST_F(DjlibServiceTest, cratesFileThatStaysEmptyRemovesTheCrates) {
     ASSERT_TRUE(waitIdle());
     EXPECT_TRUE(managedCrates(1).isEmpty());
     EXPECT_TRUE(track(1));
+}
+
+TEST_F(DjlibServiceTest, metadataIsNeverExportedIntoTheLibraryFolder) {
+    writeCrates({"crate_a"});
+    startService();
+    writePackage(1);
+    writeSidecar(1, 1, {"crate_a"});
+    ASSERT_TRUE(QTest::qWaitFor([this] { return hasDjlibBeats(1); }, kTimeoutMillis));
+    ASSERT_TRUE(waitIdle());
+
+    // The same ordinary file inside and outside of the library folder.
+    const QString mp3 = getTestDir().filePath(QStringLiteral("id3-test-data/artist.mp3"));
+    QTemporaryDir otherDir;
+    ASSERT_TRUE(otherDir.isValid());
+    const QString inside = tracksPath(QStringLiteral("extra.mp3"));
+    const QString outside = QDir(otherDir.path()).filePath(QStringLiteral("extra.mp3"));
+    ASSERT_TRUE(QFile::copy(mp3, inside));
+    ASSERT_TRUE(QFile::copy(mp3, outside));
+
+    const auto bytesOf = [](const QString& path) {
+        QFile file(path);
+        return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray();
+    };
+    // Both ways of asking for an export: explicitly and by the preference.
+    const auto editAndSave = [this, &bytesOf](const QString& path, bool markForExport) {
+        const QByteArray before = bytesOf(path);
+        EXPECT_FALSE(before.isEmpty());
+        {
+            const TrackPointer pTrack = trackCollectionManager()->getOrAddTrack(
+                    TrackRef::fromFilePath(path));
+            EXPECT_TRUE(pTrack);
+            if (!pTrack) {
+                return false;
+            }
+            pTrack->setTitle(pTrack->getTitle() + QStringLiteral(" (edited)"));
+            if (markForExport) {
+                pTrack->markForMetadataExport();
+            }
+            trackCollectionManager()->saveTrack(pTrack);
+        }
+        return bytesOf(path) != before;
+    };
+    EXPECT_TRUE(editAndSave(outside, true)); // the export does work
+    EXPECT_FALSE(editAndSave(inside, true));
+    EXPECT_FALSE(editAndSave(tracksPath(packageName(1)), true));
+
+    config()->setValue(mixxx::library::prefs::kSyncTrackMetadataConfigKey, 1);
+    EXPECT_TRUE(editAndSave(outside, false));
+    EXPECT_FALSE(editAndSave(inside, false));
+    EXPECT_FALSE(editAndSave(tracksPath(packageName(1)), false));
+
+    // Without the service nothing is protected any more.
+    stopService();
+    EXPECT_TRUE(editAndSave(inside, true));
 }
 
 TEST_F(DjlibServiceTest, burstOf200SidecarsIsAppliedOnceEach) {
