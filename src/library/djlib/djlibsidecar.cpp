@@ -22,6 +22,10 @@ bool fail(QString* pError, const QString& message) {
 
 /// Parses `json` into a root object.
 bool parseRootObject(const QByteArray& json, QJsonObject* pObject, QString* pError) {
+    if (json.size() > djlib::kMaxJsonBytes) {
+        return fail(pError,
+                QStringLiteral("file is too large (%1 bytes)").arg(json.size()));
+    }
     QJsonParseError parseError;
     const QJsonDocument doc = QJsonDocument::fromJson(json, &parseError);
     if (parseError.error != QJsonParseError::NoError) {
@@ -74,6 +78,33 @@ bool readPositive(const QJsonValue& value,
     }
     if (*pResult <= 0) {
         return fail(pError, QStringLiteral("%1 must be > 0").arg(name));
+    }
+    return true;
+}
+
+/// A position or time in seconds: 0..24 h.
+bool readSeconds(const QJsonValue& value,
+        const QString& name,
+        double* pResult,
+        QString* pError) {
+    if (!readNonNegative(value, name, pResult, pError)) {
+        return false;
+    }
+    if (*pResult > djlib::kMaxSeconds) {
+        return fail(pError, QStringLiteral("%1 is out of range").arg(name));
+    }
+    return true;
+}
+
+bool readBpm(const QJsonValue& value,
+        const QString& name,
+        double* pResult,
+        QString* pError) {
+    if (!readPositive(value, name, pResult, pError)) {
+        return false;
+    }
+    if (*pResult < djlib::kMinBpm || *pResult > djlib::kMaxBpm) {
+        return fail(pError, QStringLiteral("%1 is out of range").arg(name));
     }
     return true;
 }
@@ -189,6 +220,9 @@ bool readCrateList(const QJsonObject& object,
         return fail(pError, QStringLiteral("crates must be an array"));
     }
     const QJsonArray array = value.toArray();
+    if (array.size() > djlib::kMaxCrates) {
+        return fail(pError, QStringLiteral("crates has too many entries"));
+    }
     QList<djlib::CrateRef> crates;
     crates.reserve(array.size());
     for (qsizetype i = 0; i < array.size(); ++i) {
@@ -227,11 +261,11 @@ bool readGrid(const QJsonObject& object, DjlibSidecar::Grid* pGrid, QString* pEr
         return fail(pError, QStringLiteral("grid must be an object for constant tempo"));
     }
     const QJsonObject grid = value.toObject();
-    return readNonNegative(grid.value(QStringLiteral("first_beat_s")),
+    return readSeconds(grid.value(QStringLiteral("first_beat_s")),
                    QStringLiteral("grid.first_beat_s"),
                    &pGrid->firstBeatSeconds,
                    pError) &&
-            readPositive(grid.value(QStringLiteral("bpm")),
+            readBpm(grid.value(QStringLiteral("bpm")),
                     QStringLiteral("grid.bpm"),
                     &pGrid->bpm,
                     pError);
@@ -243,18 +277,24 @@ bool readBeats(const QJsonObject& object, QList<double>* pBeats, QString* pError
         return fail(pError, QStringLiteral("beats_s must be an array for variable tempo"));
     }
     const QJsonArray array = value.toArray();
-    if (array.isEmpty()) {
-        return fail(pError, QStringLiteral("beats_s must not be empty"));
+    // Mixxx needs two beats for a tempo.
+    if (array.size() < 2) {
+        return fail(pError, QStringLiteral("beats_s must have at least two beats"));
+    }
+    if (array.size() > djlib::kMaxBeats) {
+        return fail(pError, QStringLiteral("beats_s has too many beats"));
     }
     QList<double> beats;
     beats.reserve(array.size());
     for (qsizetype i = 0; i < array.size(); ++i) {
         double beat;
-        if (!readNonNegative(array.at(i), QStringLiteral("beats_s[%1]").arg(i), &beat, pError)) {
+        if (!readSeconds(array.at(i), QStringLiteral("beats_s[%1]").arg(i), &beat, pError)) {
             return false;
         }
-        if (!beats.isEmpty() && beat <= beats.last()) {
-            return fail(pError, QStringLiteral("beats_s must be strictly ascending (index %1)").arg(i));
+        // Beats closer than this would fall onto the same frame.
+        if (!beats.isEmpty() && beat < beats.last() + djlib::kMinBeatSeconds) {
+            return fail(pError,
+                    QStringLiteral("beats_s must be strictly ascending (index %1)").arg(i));
         }
         beats.append(beat);
     }
@@ -284,6 +324,12 @@ bool readReplayGain(const QJsonObject& object,
                     &replayGain.peak,
                     pError)) {
         return false;
+    }
+    if (std::fabs(replayGain.gainDb) > djlib::kMaxGainDb) {
+        return fail(pError, QStringLiteral("replaygain.gain_db is out of range"));
+    }
+    if (replayGain.peak > djlib::kMaxPeak) {
+        return fail(pError, QStringLiteral("replaygain.peak is out of range"));
     }
     *pResult = replayGain;
     return true;
@@ -327,7 +373,7 @@ bool readCue(const QJsonValue& value,
         *pSkip = true;
         return true;
     }
-    if (!readNonNegative(object.value(QStringLiteral("pos_s")),
+    if (!readSeconds(object.value(QStringLiteral("pos_s")),
                 context + QStringLiteral(".pos_s"),
                 &pCue->posSeconds,
                 pError)) {
@@ -337,7 +383,7 @@ bool readCue(const QJsonValue& value,
     if (label.isUndefined() || label.isNull()) {
         pCue->label.clear();
     } else if (label.isString()) {
-        pCue->label = label.toString();
+        pCue->label = label.toString().left(djlib::kMaxLabelChars);
     } else {
         return fail(pError, QStringLiteral("%1.label must be a string or null").arg(context));
     }
@@ -353,6 +399,9 @@ bool readCues(const QJsonObject& object, QList<DjlibSidecar::Cue>* pCues, QStrin
         return fail(pError, QStringLiteral("cues must be an array"));
     }
     const QJsonArray array = value.toArray();
+    if (array.size() > djlib::kMaxCues) {
+        return fail(pError, QStringLiteral("cues has too many entries"));
+    }
     QList<DjlibSidecar::Cue> cues;
     cues.reserve(array.size());
     for (qsizetype i = 0; i < array.size(); ++i) {
@@ -426,7 +475,7 @@ bool parseSidecarObject(const QJsonObject& object, DjlibSidecar* pSidecar, QStri
         s.bpm.reset();
     } else {
         double bpm;
-        if (!readPositive(value, QStringLiteral("bpm"), &bpm, pError)) {
+        if (!readBpm(value, QStringLiteral("bpm"), &bpm, pError)) {
             return false;
         }
         s.bpm = bpm;
@@ -463,7 +512,7 @@ bool parseSidecarObject(const QJsonObject& object, DjlibSidecar* pSidecar, QStri
         s.firstDownbeatSeconds.reset();
     } else {
         double downbeat;
-        if (!readNonNegative(value, QStringLiteral("first_downbeat_s"), &downbeat, pError)) {
+        if (!readSeconds(value, QStringLiteral("first_downbeat_s"), &downbeat, pError)) {
             return false;
         }
         s.firstDownbeatSeconds = downbeat;

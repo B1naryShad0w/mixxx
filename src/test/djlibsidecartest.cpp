@@ -464,6 +464,113 @@ TEST(DjlibSidecarTest, rejectsGarbage) {
     EXPECT_FALSE(DjlibSidecar::parse(QByteArrayLiteral("garbage")));
 }
 
+TEST(DjlibSidecarTest, rejectsOutOfRangeValues) {
+    const auto set = [](QJsonObject object, const QString& outer, const QString& inner, double v) {
+        QJsonObject child = object.value(outer).toObject();
+        child.insert(inner, v);
+        object.insert(outer, child);
+        return object;
+    };
+    const auto withCuePos = [](double pos) {
+        QJsonObject object = sampleObject();
+        object.insert(QStringLiteral("cues"),
+                QJsonArray{QJsonObject{{QStringLiteral("type"), "main"},
+                        {QStringLiteral("pos_s"), pos}}});
+        return object;
+    };
+    QJsonObject bpm = sampleObject();
+    bpm.insert(QStringLiteral("bpm"), 1e300);
+    QJsonObject downbeat = sampleObject();
+    downbeat.insert(QStringLiteral("first_downbeat_s"), 1e9);
+    QJsonObject oneBeat = sampleObject(kVariableSample);
+    oneBeat.insert(QStringLiteral("beats_s"), QJsonArray{0.5});
+    QJsonObject sameFrame = sampleObject(kVariableSample);
+    sameFrame.insert(QStringLiteral("beats_s"), QJsonArray{0.5, 0.500001, 1.0});
+    QJsonObject lateBeat = sampleObject(kVariableSample);
+    lateBeat.insert(QStringLiteral("beats_s"), QJsonArray{0.5, 1e300});
+    QJsonArray manyBeats;
+    for (qsizetype i = 0; i <= djlib::kMaxBeats; ++i) {
+        manyBeats.append(0.25 * static_cast<double>(i + 1));
+    }
+    QJsonObject tooManyBeats = sampleObject(kVariableSample);
+    tooManyBeats.insert(QStringLiteral("beats_s"), manyBeats);
+    QJsonArray manyCues;
+    for (qsizetype i = 0; i <= djlib::kMaxCues; ++i) {
+        manyCues.append(QJsonObject{{QStringLiteral("type"), "main"},
+                {QStringLiteral("pos_s"), 1.0}});
+    }
+    QJsonObject tooManyCues = sampleObject();
+    tooManyCues.insert(QStringLiteral("cues"), manyCues);
+
+    const QList<QJsonObject> bad = {
+            bpm,
+            downbeat,
+            set(sampleObject(), QStringLiteral("grid"), QStringLiteral("bpm"), 1e300),
+            set(sampleObject(), QStringLiteral("grid"), QStringLiteral("bpm"), 0.001),
+            set(sampleObject(), QStringLiteral("grid"), QStringLiteral("first_beat_s"), 1e300),
+            set(sampleObject(), QStringLiteral("replaygain"), QStringLiteral("gain_db"), 5000),
+            set(sampleObject(), QStringLiteral("replaygain"), QStringLiteral("gain_db"), -5000),
+            set(sampleObject(), QStringLiteral("replaygain"), QStringLiteral("peak"), 1e300),
+            withCuePos(1e300),
+            oneBeat,
+            sameFrame,
+            lateBeat,
+            tooManyBeats,
+            tooManyCues,
+    };
+    for (const auto& object : bad) {
+        QString error;
+        EXPECT_FALSE(parseObject(object, &error))
+                << toJson(object).left(300).toStdString();
+        EXPECT_FALSE(error.isEmpty());
+    }
+
+    // The limits themselves are fine.
+    QString error;
+    EXPECT_TRUE(parseObject(
+            set(sampleObject(), QStringLiteral("grid"), QStringLiteral("bpm"), djlib::kMaxBpm),
+            &error))
+            << error.toStdString();
+    EXPECT_TRUE(parseObject(set(sampleObject(),
+                                    QStringLiteral("replaygain"),
+                                    QStringLiteral("gain_db"),
+                                    -djlib::kMaxGainDb),
+            &error))
+            << error.toStdString();
+    EXPECT_TRUE(parseObject(withCuePos(djlib::kMaxSeconds), &error)) << error.toStdString();
+}
+
+TEST(DjlibSidecarTest, cutsLongCueLabels) {
+    QJsonObject object = sampleObject();
+    object.insert(QStringLiteral("cues"),
+            QJsonArray{QJsonObject{{QStringLiteral("type"), "hotcue"},
+                    {QStringLiteral("number"), 1},
+                    {QStringLiteral("pos_s"), 1.0},
+                    {QStringLiteral("label"), QString(1024 * 1024, QChar('x'))}}});
+    QString error;
+    const auto sidecar = parseObject(object, &error);
+    ASSERT_TRUE(sidecar) << error.toStdString();
+    ASSERT_EQ(1, sidecar->cues.size());
+    EXPECT_EQ(djlib::kMaxLabelChars, sidecar->cues[0].label.size());
+}
+
+TEST(DjlibSidecarTest, rejectsTooLargeFiles) {
+    // Valid JSON, but more than a sidecar may ever be.
+    QJsonObject object = sampleObject();
+    object.insert(QStringLiteral("padding"),
+            QString(static_cast<qsizetype>(djlib::kMaxJsonBytes), QChar('x')));
+    QString error;
+    EXPECT_FALSE(DjlibSidecar::parse(toJson(object), &error));
+    EXPECT_TRUE(error.contains(QStringLiteral("too large"))) << error.toStdString();
+
+    QJsonObject crates{{QStringLiteral("schema"), 1},
+            {QStringLiteral("crates"), QJsonArray()},
+            {QStringLiteral("padding"),
+                    QString(static_cast<qsizetype>(djlib::kMaxJsonBytes), QChar('x'))}};
+    EXPECT_FALSE(djlib::parseCratesJson(toJson(crates), &error));
+    EXPECT_TRUE(error.contains(QStringLiteral("too large"))) << error.toStdString();
+}
+
 TEST(DjlibCratesJsonTest, parsesCrateList) {
     QString error;
     const auto crates = djlib::parseCratesJson(QByteArrayLiteral(

@@ -22,6 +22,20 @@ struct CrateRef {
     }
 };
 
+/// Limits: a broken or hostile file must never hurt Mixxx. Files and values
+/// beyond them are invalid (cue labels are cut instead).
+constexpr qint64 kMaxJsonBytes = 4 * 1024 * 1024; // sidecar or crates.json
+constexpr double kMaxSeconds = 24 * 60 * 60.0;    // any position
+constexpr double kMinBpm = 10.0;
+constexpr double kMaxBpm = 500.0; // mixxx::Bpm::kValueMax
+constexpr double kMaxGainDb = 60.0; // +-
+constexpr double kMaxPeak = 100.0;
+constexpr qsizetype kMaxBeats = 200000;
+constexpr double kMinBeatSeconds = 0.01; // between two beats of `beats_s`
+constexpr qsizetype kMaxCues = 1000;
+constexpr qsizetype kMaxCrates = 10000;
+constexpr qsizetype kMaxLabelChars = 256;
+
 /// Parses `<library>/_djlib/crates.json` (`{"schema": 1, "crates": [{"id", "name"}, ...]}`).
 /// Returns std::nullopt and sets *pError (if given) when the document is invalid.
 /// Unknown fields are ignored. Pure function, safe on any thread.
@@ -34,8 +48,10 @@ std::optional<QList<CrateRef>> parseCratesJson(
 /// schema 1 of docs/sync-contract.md "Sidecar". Times are in seconds.
 ///
 /// Validation: schema must be 1; required fields must be present with the right
-/// type; every number finite; times >= 0; BPMs > 0; `beats_s` strictly
-/// ascending; known cue types "main"/"hotcue" (hot cue `number` >= 1) are
+/// type; every number finite; times >= 0 and at most 24 h; BPMs within
+/// 10..500; `beats_s` at least two beats, ascending by at least 10 ms;
+/// ReplayGain within +-60 dB, peak at most 100; at most 4 MiB of JSON (more
+/// limits: `djlib::kMax...`); known cue types "main"/"hotcue" (hot cue `number` >= 1) are
 /// validated, cues of unknown types are skipped and an unknown tempo value is
 /// treated as "unknown" (forward compatibility within schema 1). Nullable fields
 /// may also be absent (treated as null). Unknown fields are ignored. Beat data
@@ -84,7 +100,7 @@ struct DjlibSidecar {
     std::optional<double> bpm;
     std::optional<QString> bpmSource;
     std::optional<Grid> grid;                 // set iff tempo == Constant
-    std::optional<QList<double>> beatsSeconds; // set iff tempo == Variable, non-empty
+    std::optional<QList<double>> beatsSeconds; // set iff tempo == Variable, >= 2 beats
     std::optional<double> firstDownbeatSeconds;
     std::optional<QString> key; // Mixxx traditional notation, e.g. "Am", "F#"
     std::optional<ReplayGain> replayGain;
