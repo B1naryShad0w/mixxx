@@ -124,7 +124,16 @@ mixxx::BeatsPointer makeBeats(const DjlibSidecar& sidecar, mixxx::audio::SampleR
         QVector<mixxx::audio::FramePos> positions;
         positions.reserve(sidecar.beatsSeconds->size());
         for (const double seconds : std::as_const(*sidecar.beatsSeconds)) {
-            positions.append(mixxx::audio::FramePos(seconds * rate).toNearestFrameBoundary());
+            const auto position =
+                    mixxx::audio::FramePos(seconds * rate).toNearestFrameBoundary();
+            // fromBeatPositions() asserts on beats that share a frame.
+            if (!positions.isEmpty() && position <= positions.last()) {
+                return nullptr;
+            }
+            positions.append(position);
+        }
+        if (positions.size() < 2) {
+            return nullptr;
         }
         return mixxx::Beats::fromBeatPositions(
                 sampleRate, positions, DjlibImporter::kBeatsSubVersion);
@@ -136,12 +145,44 @@ mixxx::BeatsPointer makeBeats(const DjlibSidecar& sidecar, mixxx::audio::SampleR
 }
 
 /// trySetBeats() discards new beats while the BPM is locked (research §2):
-/// unlock, set, relock.
+/// unlock, set, relock. Beats that were not taken leave the lock as it was
+/// (a lock without our fingerprint would read as DJ work later).
 bool applyBeats(Track* pTrack, const mixxx::BeatsPointer& pBeats) {
+    const bool wasLocked = pTrack->isBpmLocked();
     pTrack->setBpmLocked(false);
     pTrack->trySetBeats(pBeats);
-    pTrack->setBpmLocked(true);
-    return pTrack->getBeats() == pBeats;
+    const bool applied = pTrack->getBeats() == pBeats;
+    pTrack->setBpmLocked(applied || wasLocked);
+    return applied;
+}
+
+/// True if the main cue was moved by the DJ since the `baseline` cues
+/// fingerprint was taken. AnalyzerSilence puts a main cue that is unset (or
+/// at the pre-2.3 default 0) on the first sound: that is not an edit.
+bool mainCueMovedSince(const QString& baseline, const Track& track) {
+    if (baseline.isEmpty()) {
+        return false;
+    }
+    const auto current = track.getMainCuePosition();
+    if (!current.isValid()) {
+        return false;
+    }
+    const QJsonValue before = QJsonDocument::fromJson(baseline.toUtf8())
+                                      .object()
+                                      .value(QLatin1String("main"));
+    if (before.isDouble() &&
+            std::abs(before.toDouble() - current.value()) <= kFrameTolerance) {
+        return false;
+    }
+    if (!before.isDouble() || before.toDouble() == mixxx::audio::kStartFramePos.value()) {
+        const CuePointer pSound = track.findCueByType(mixxx::CueType::N60dBSound);
+        if (pSound && pSound->getPosition().isValid() &&
+                std::abs(pSound->getPosition().value() - current.value()) <=
+                        kFrameTolerance) {
+            return false;
+        }
+    }
+    return true;
 }
 
 void applyCues(Track* pTrack,
@@ -272,18 +313,40 @@ DjlibImporter::ApplyResult DjlibImporter::apply(const TrackPointer& pTrack,
         const DjlibSidecar& sidecar,
         DjlibStore& store,
         bool trackLoaded,
-        const QSet<QString>& allowedCrateIds) {
+        const QSet<QString>& allowedCrateIds,
+        const Baseline& baseline) {
+    VERIFY_OR_DEBUG_ASSERT(pTrack && !sidecar.trackId.isEmpty()) {
+        return ApplyResult();
+    }
+    ApplyResult result = prepare(pTrack,
+            sidecar,
+            store.trackState(sidecar.trackId),
+            trackLoaded,
+            allowedCrateIds,
+            baseline);
+    if (!result.outdated) {
+        result.stored = store.upsertTrackState(result.state);
+    }
+    return result;
+}
+
+DjlibImporter::ApplyResult DjlibImporter::prepare(const TrackPointer& pTrack,
+        const DjlibSidecar& sidecar,
+        const std::optional<DjlibStore::TrackState>& existing,
+        bool trackLoaded,
+        const QSet<QString>& allowedCrateIds,
+        const Baseline& baseline) {
     ApplyResult result;
     VERIFY_OR_DEBUG_ASSERT(pTrack && !sidecar.trackId.isEmpty()) {
         return result;
     }
 
-    const auto existing = store.trackState(sidecar.trackId);
     if (existing && sidecar.sidecarVersion <= existing->sidecarVersion) {
         result.outdated = true;
         return result;
     }
-    DjlibStore::TrackState state = existing.value_or(DjlibStore::TrackState());
+    DjlibStore::TrackState& state = result.state;
+    state = existing.value_or(DjlibStore::TrackState());
     state.djlibId = sidecar.trackId;
     state.trackId = pTrack->getId();
     state.file = sidecar.file;
@@ -310,19 +373,31 @@ DjlibImporter::ApplyResult DjlibImporter::apply(const TrackPointer& pTrack,
 
     const mixxx::audio::SampleRate sampleRate = pTrack->getSampleRate();
 
-    // Beats. Without a fingerprint, locked beats are DJ work (research §2).
+    // Beats. Without a fingerprint, locked beats are DJ work (research §2),
+    // and so are beats that changed since a deferral on a loaded deck.
     if (sidecar.tempo != DjlibSidecar::Tempo::Unknown) {
         const auto pCurrent = pTrack->getBeats();
-        const bool edited = state.appliedBeats.isEmpty()
-                ? (pCurrent && pTrack->isBpmLocked())
-                : !fingerprintsMatch(state.appliedBeats, beatsFingerprint(pCurrent));
-        if (trackLoaded) {
-            result.beats = Field::Deferred;
-        } else if (edited) {
+        const QString current = beatsFingerprint(pCurrent);
+        bool edited;
+        if (!state.appliedBeats.isEmpty()) {
+            edited = !fingerprintsMatch(state.appliedBeats, current);
+        } else {
+            edited = (pCurrent && pTrack->isBpmLocked()) ||
+                    (!baseline.beats.isEmpty() &&
+                            baseline.beats != beatsFingerprint(nullptr) &&
+                            !fingerprintsMatch(baseline.beats, current));
+        }
+        if (edited) {
             result.beats = Field::KeptDjEdit;
+        } else if (trackLoaded) {
+            result.beats = Field::Deferred;
+            if (state.appliedBeats.isEmpty()) {
+                result.baseline.beats = baseline.beats.isEmpty() ? current : baseline.beats;
+            }
         } else if (!sampleRate.isValid()) {
             result.beats = Field::Deferred;
             result.needsSampleRate = true;
+            result.baseline.beats = baseline.beats;
         } else {
             const auto pBeats = makeBeats(sidecar, sampleRate);
             if (pBeats && applyBeats(pTrack.get(), pBeats)) {
@@ -335,18 +410,27 @@ DjlibImporter::ApplyResult DjlibImporter::apply(const TrackPointer& pTrack,
         }
     }
 
-    // Cues. Without a fingerprint, existing hot cues are DJ work.
+    // Cues. Without a fingerprint, existing hot cues are DJ work, and so is
+    // a main cue moved since a deferral on a loaded deck.
     if (!sidecar.cues.isEmpty()) {
-        const bool edited = state.appliedCues.isEmpty()
-                ? hasHotCues(*pTrack)
-                : !fingerprintsMatch(state.appliedCues, cuesFingerprint(*pTrack));
-        if (trackLoaded) {
-            result.cues = Field::Deferred;
-        } else if (edited) {
+        const QString current = cuesFingerprint(*pTrack);
+        bool edited;
+        if (!state.appliedCues.isEmpty()) {
+            edited = !fingerprintsMatch(state.appliedCues, current);
+        } else {
+            edited = hasHotCues(*pTrack) || mainCueMovedSince(baseline.cues, *pTrack);
+        }
+        if (edited) {
             result.cues = Field::KeptDjEdit;
+        } else if (trackLoaded) {
+            result.cues = Field::Deferred;
+            if (state.appliedCues.isEmpty()) {
+                result.baseline.cues = baseline.cues.isEmpty() ? current : baseline.cues;
+            }
         } else if (!sampleRate.isValid()) {
             result.cues = Field::Deferred;
             result.needsSampleRate = true;
+            result.baseline.cues = baseline.cues;
         } else {
             applyCues(pTrack.get(), sidecar.cues, sampleRate);
             result.cues = Field::Applied;
@@ -365,10 +449,10 @@ DjlibImporter::ApplyResult DjlibImporter::apply(const TrackPointer& pTrack,
         if (newKey == mixxx::track::io::key::INVALID) {
             kLogger.warning() << "Unparsable key" << *sidecar.key << "for" << sidecar.trackId;
             result.key = Field::Failed;
-        } else if (trackLoaded) {
-            result.key = Field::Deferred;
         } else if (edited) {
             result.key = Field::KeptDjEdit;
+        } else if (trackLoaded) {
+            result.key = Field::Deferred;
         } else {
             // Tagged so the AnalyzerKey guard leaves exactly these keys alone.
             Keys keys = KeyFactory::makeBasicKeys(newKey, mixxx::track::io::key::FILE_METADATA);
@@ -384,6 +468,5 @@ DjlibImporter::ApplyResult DjlibImporter::apply(const TrackPointer& pTrack,
     if (!result.hasDeferred()) {
         state.sidecarVersion = sidecar.sidecarVersion;
     }
-    result.stored = store.upsertTrackState(state);
     return result;
 }

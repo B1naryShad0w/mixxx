@@ -93,12 +93,15 @@ class DjlibImporterTest : public LibraryTest {
         EXPECT_TRUE(m_sync.reconcile({{"crate_a", "House"}, {"crate_b", "Techno"}}));
     }
 
-    DjlibImporter::ApplyResult apply(const QJsonObject& json, bool trackLoaded = false) {
+    DjlibImporter::ApplyResult apply(const QJsonObject& json,
+            bool trackLoaded = false,
+            const DjlibImporter::Baseline& baseline = DjlibImporter::Baseline()) {
         return m_importer.apply(m_pTrack,
                 parse(json),
                 m_store,
                 trackLoaded,
-                QSet<QString>{"crate_a", "crate_b"});
+                QSet<QString>{"crate_a", "crate_b"},
+                baseline);
     }
 
     double sampleRate() const {
@@ -414,6 +417,136 @@ TEST_F(DjlibImporterTest, loadedDeckDefersFirstImport) {
     ASSERT_TRUE(state.has_value());
     EXPECT_EQ(0, state->sidecarVersion);
     EXPECT_EQ(Field::Applied, apply(sidecarJson(3)).beats);
+}
+
+TEST_F(DjlibImporterTest, gridChangedOnTheDeckDuringFirstImportIsKept) {
+    // Analyzer beats (unlocked) exist when the first sidecar arrives while
+    // the track is on a deck.
+    const auto analyzed = mixxx::Beats::fromConstTempo(
+            m_pTrack->getSampleRate(), frames(0.05), mixxx::Bpm(120.0));
+    ASSERT_TRUE(m_pTrack->trySetBeats(analyzed));
+    const auto loaded = apply(sidecarJson(3), true);
+    EXPECT_EQ(Field::Deferred, loaded.beats);
+    EXPECT_FALSE(loaded.baseline.beats.isEmpty());
+
+    // The DJ moves the grid without locking it.
+    const auto moved = mixxx::Beats::fromConstTempo(
+            m_pTrack->getSampleRate(), frames(0.30), mixxx::Bpm(120.0));
+    ASSERT_TRUE(m_pTrack->trySetBeats(moved));
+    const auto unloaded = apply(sidecarJson(3), false, loaded.baseline);
+    EXPECT_EQ(Field::KeptDjEdit, unloaded.beats);
+    EXPECT_EQ(moved, m_pTrack->getBeats());
+    EXPECT_FALSE(m_pTrack->isBpmLocked());
+    EXPECT_EQ(3, m_store.trackState(kDjlibId)->sidecarVersion);
+}
+
+TEST_F(DjlibImporterTest, unchangedGridAfterDeferredFirstImportIsReplaced) {
+    const auto analyzed = mixxx::Beats::fromConstTempo(
+            m_pTrack->getSampleRate(), frames(0.05), mixxx::Bpm(120.0));
+    ASSERT_TRUE(m_pTrack->trySetBeats(analyzed));
+    const auto loaded = apply(sidecarJson(3), true);
+    // Still loaded: the first baseline is kept.
+    const auto again = apply(sidecarJson(3), true, loaded.baseline);
+    EXPECT_EQ(loaded.baseline.beats, again.baseline.beats);
+    EXPECT_EQ(Field::Applied, apply(sidecarJson(3), false, again.baseline).beats);
+    EXPECT_NEAR(124.0, m_pTrack->getBpm(), 1e-6);
+}
+
+TEST_F(DjlibImporterTest, analyzerResultsDuringDeferredFirstImportAreReplaced) {
+    // Nothing analysed yet when the track goes on the deck.
+    ASSERT_FALSE(m_pTrack->getBeats());
+    const auto loaded = apply(sidecarJson(3), true);
+    EXPECT_EQ(Field::Deferred, loaded.beats);
+    EXPECT_EQ(Field::Deferred, loaded.cues);
+
+    // The analyzers finish: beats, and AnalyzerSilence sets the main cue.
+    ASSERT_TRUE(m_pTrack->trySetBeats(mixxx::Beats::fromConstTempo(
+            m_pTrack->getSampleRate(), frames(0.05), mixxx::Bpm(120.0))));
+    m_pTrack->createAndAddCue(mixxx::CueType::N60dBSound,
+            Cue::kNoHotCue,
+            frames(0.02),
+            frames(9.0));
+    m_pTrack->setMainCuePosition(frames(0.02));
+
+    const auto unloaded = apply(sidecarJson(3), false, loaded.baseline);
+    EXPECT_EQ(Field::Applied, unloaded.beats);
+    EXPECT_EQ(Field::Applied, unloaded.cues);
+    EXPECT_NEAR(124.0, m_pTrack->getBpm(), 1e-6);
+    expectFramesNear(frames(0.5795), m_pTrack->getMainCuePosition());
+}
+
+TEST_F(DjlibImporterTest, mainCueMovedOnTheDeckDuringFirstImportIsKept) {
+    m_pTrack->setMainCuePosition(frames(0.02));
+    const auto loaded = apply(sidecarJson(3), true);
+    EXPECT_EQ(Field::Deferred, loaded.cues);
+
+    m_pTrack->setMainCuePosition(frames(2.0)); // the DJ's cue point
+    const auto unloaded = apply(sidecarJson(3), false, loaded.baseline);
+    EXPECT_EQ(Field::KeptDjEdit, unloaded.cues);
+    EXPECT_EQ(Field::Applied, unloaded.beats);
+    expectFramesNear(frames(2.0), m_pTrack->getMainCuePosition());
+    EXPECT_TRUE(hotCues().isEmpty());
+}
+
+TEST_F(DjlibImporterTest, mainCueSetOnTheDeckDuringFirstImportIsKept) {
+    // No main cue yet; the analyzer finds the first sound, the DJ then puts
+    // the cue somewhere else.
+    const auto loaded = apply(sidecarJson(3), true);
+    m_pTrack->createAndAddCue(mixxx::CueType::N60dBSound,
+            Cue::kNoHotCue,
+            frames(0.02),
+            frames(9.0));
+    m_pTrack->setMainCuePosition(frames(2.0));
+    EXPECT_EQ(Field::KeptDjEdit, apply(sidecarJson(3), false, loaded.baseline).cues);
+    expectFramesNear(frames(2.0), m_pTrack->getMainCuePosition());
+}
+
+TEST_F(DjlibImporterTest, prepareWritesNoRow) {
+    const auto result = m_importer.prepare(m_pTrack,
+            parse(sidecarJson(3)),
+            std::nullopt,
+            false,
+            QSet<QString>{"crate_a"});
+    EXPECT_EQ(Field::Applied, result.beats);
+    EXPECT_FALSE(result.stored);
+    EXPECT_FALSE(m_store.trackState(kDjlibId).has_value());
+    EXPECT_EQ(kDjlibId, result.state.djlibId);
+    EXPECT_EQ(m_pTrack->getId(), result.state.trackId);
+    EXPECT_EQ(3, result.state.sidecarVersion);
+    EXPECT_FALSE(result.state.appliedBeats.isEmpty());
+
+    // The caller's row decides what is outdated and what was applied.
+    const auto outdated = m_importer.prepare(m_pTrack,
+            parse(sidecarJson(3)),
+            result.state,
+            false,
+            QSet<QString>{"crate_a"});
+    EXPECT_TRUE(outdated.outdated);
+    auto json = sidecarJson(4);
+    json["grid"] = QJsonObject{{"first_beat_s", 0.2}, {"bpm", 126.0}};
+    const auto newer = m_importer.prepare(m_pTrack,
+            parse(json),
+            result.state,
+            false,
+            QSet<QString>{"crate_a"});
+    EXPECT_EQ(Field::Applied, newer.beats);
+    EXPECT_NEAR(126.0, m_pTrack->getBpm(), 1e-6);
+}
+
+TEST_F(DjlibImporterTest, beatsOnTheSameFrameAreRejected) {
+    auto json = sidecarJson(3);
+    json["tempo"] = "variable";
+    json["grid"] = QJsonValue();
+    json["beats_s"] = QJsonArray{0.5, 1.0, 1.5};
+    auto sidecar = parse(json);
+    // Not reachable through the parser (minimum spacing); the importer must
+    // still not hand such positions to Beats::fromBeatPositions().
+    sidecar.beatsSeconds = QList<double>{0.5, 0.500001, 1.0};
+    const auto result = m_importer.apply(
+            m_pTrack, sidecar, m_store, false, QSet<QString>{"crate_a"});
+    EXPECT_EQ(Field::Failed, result.beats);
+    EXPECT_FALSE(m_pTrack->getBeats());
+    EXPECT_FALSE(m_pTrack->isBpmLocked());
 }
 
 TEST_F(DjlibImporterTest, unknownTempoLeavesBeatsUntouched) {

@@ -4,11 +4,11 @@
 #include <QString>
 
 #include "library/djlib/djlibsidecar.h"
+#include "library/djlib/djlibstore.h"
 #include "track/beats.h"
 #include "track/track_decl.h"
 
 class DjlibCrateSync;
-class DjlibStore;
 
 /// Applies one parsed sidecar to one library track (research §2-5, §7).
 ///
@@ -34,13 +34,25 @@ class DjlibStore;
 /// still unknown (beats/cues only; probe and call again), those fields are
 /// deferred: crates/ReplayGain are applied, but the stored `sidecar_version`
 /// is not raised, so calling `apply()` again with the same sidecar later
-/// completes the import.
+/// completes the import. A first import (no fingerprint yet) deferred on a
+/// loaded deck also reports the fingerprints of the track's beats and cues at
+/// that time (`Baseline`). Passed in again on the next call they tell what the
+/// DJ changed meanwhile: beats that existed and are different now, or a main
+/// cue that has moved, are kept. Beats that only appeared meanwhile and a
+/// main cue that went from unset to the first sound are the analyzers' and
+/// are replaced.
 ///
 /// Sidecars whose `sidecar_version` is not greater than the last fully applied
 /// one are ignored (`outdated`).
 ///
-/// Synchronous, main thread only. The caller saves the track afterwards
-/// (`TrackCollectionManager::saveTrack`).
+/// `prepare()` changes the track and the crates but writes no `djlib_tracks`
+/// row: the caller saves the track (`TrackCollectionManager::saveTrack`) and
+/// stores `ApplyResult::state` only if that worked. Otherwise a failed save
+/// would leave fingerprints of values the library never got, and the next
+/// sidecar would take the old values for DJ edits. `apply()` does both steps
+/// without saving the track (tests, callers that save themselves).
+///
+/// Synchronous, main thread only.
 class DjlibImporter {
   public:
     static const QString kBeatsSubVersion; // "djlib/1"
@@ -55,6 +67,13 @@ class DjlibImporter {
         Failed,     // the sidecar data was rejected by Mixxx
     };
 
+    /// Fingerprints taken when a first import was deferred on a loaded deck
+    /// (empty: none taken).
+    struct Baseline {
+        QString beats;
+        QString cues;
+    };
+
     struct ApplyResult {
         bool outdated = false;        // sidecar_version <= stored: nothing done
         bool needsSampleRate = false; // beats/cues deferred until the sample rate is known
@@ -63,7 +82,11 @@ class DjlibImporter {
         Field beats = Field::Untouched;
         Field cues = Field::Untouched;
         Field key = Field::Untouched;
-        bool stored = false; // djlib_tracks row written
+        bool stored = false; // djlib_tracks row written (apply() only)
+        /// The row to store once the track is saved (unless `outdated`).
+        DjlibStore::TrackState state;
+        /// For the next call with the same sidecar (see `Baseline`).
+        Baseline baseline;
 
         /// True if beats, cues or key were deferred: call apply() again
         /// (same sidecar) once the deck unloads / the sample rate is known.
@@ -75,11 +98,21 @@ class DjlibImporter {
 
     explicit DjlibImporter(DjlibCrateSync* pCrateSync);
 
+    /// `existing`: the track's `djlib_tracks` row, if any.
+    ApplyResult prepare(const TrackPointer& pTrack,
+            const DjlibSidecar& sidecar,
+            const std::optional<DjlibStore::TrackState>& existing,
+            bool trackLoaded,
+            const QSet<QString>& allowedCrateIds,
+            const Baseline& baseline = Baseline());
+
+    /// `prepare()` with the stored row, then stores the new row.
     ApplyResult apply(const TrackPointer& pTrack,
             const DjlibSidecar& sidecar,
             DjlibStore& store,
             bool trackLoaded,
-            const QSet<QString>& allowedCrateIds);
+            const QSet<QString>& allowedCrateIds,
+            const Baseline& baseline = Baseline());
 
     /// Fingerprints of the track's current values (exposed for tests).
     static QString beatsFingerprint(const mixxx::BeatsPointer& pBeats);
