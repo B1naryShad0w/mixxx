@@ -103,7 +103,11 @@ bool writeByRename(const QString& path, const QByteArray& data) {
 bool copyByRename(const QString& source, const QString& path) {
     const QString tmp = path + QStringLiteral(".tmp");
     QFile::remove(tmp);
-    return QFile::copy(source, tmp) && QFile::rename(tmp, path);
+    if (!QFile::copy(source, tmp)) {
+        return false;
+    }
+    QFile::remove(path);
+    return QFile::rename(tmp, path);
 }
 
 } // namespace
@@ -536,6 +540,25 @@ TEST_F(DjlibServiceTest, sweepRepairsRowWithAnOutdatedFileName) {
     EXPECT_EQ(QStringList{"crate_a"}, managedCrates(1));
     EXPECT_EQ(1, m_pService->store().trackState(djlibId(1))->sidecarVersion);
     EXPECT_EQ(packageName(1), m_pService->store().trackState(djlibId(1))->file);
+}
+
+TEST_F(DjlibServiceTest, packageUnreadableAtFirstIsProbedAgainWhenReplaced) {
+    writeCrates({"crate_a"});
+    startService();
+    // Not audio yet (e.g. a sync tool still filling the file).
+    ASSERT_TRUE(writeByRename(tracksPath(packageName(1)), QByteArray(4096, 'x')));
+    writeSidecar(1, 1, {"crate_a"});
+    ASSERT_TRUE(QTest::qWaitFor([this] { return track(1) != nullptr; }, kTimeoutMillis));
+    ASSERT_TRUE(waitIdle());
+    ASSERT_FALSE(hasDjlibBeats(1));
+
+    // The real package arrives; the sidecar does not change.
+    QTest::qWait(50);
+    writePackage(1);
+    ASSERT_TRUE(QTest::qWaitFor([this] { return hasDjlibBeats(1); }, kTimeoutMillis));
+    ASSERT_TRUE(waitIdle());
+    EXPECT_EQ(1, m_pService->store().trackState(djlibId(1))->sidecarVersion);
+    EXPECT_EQ(QStringList{"crate_a"}, managedCrates(1));
 }
 
 TEST_F(DjlibServiceTest, burstOf200SidecarsIsAppliedOnceEach) {

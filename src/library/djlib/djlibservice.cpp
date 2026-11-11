@@ -47,6 +47,11 @@ std::function<bool(const QString&)> s_writeFailureForTesting;
 /// this often before it waits for the next change of its file.
 constexpr int kMaxItemAttempts = 10;
 
+/// A package whose sample rate can't be read (still being written, locked
+/// by a scanner) is opened again with the safety passes, this often at most
+/// until the package changes.
+constexpr int kMaxProbeAttempts = 3;
+
 bool writeFailsForTesting(const QString& what) {
     return s_writeFailureForTesting && s_writeFailureForTesting(what);
 }
@@ -405,6 +410,7 @@ DjlibService::DjlibService(UserSettingsPointer pConfig,
     connect(&m_debounceTimer, &QTimer::timeout, this, &DjlibService::startPass);
     m_safetyTimer.setInterval(m_timing.safetyPassMillis);
     connect(&m_safetyTimer, &QTimer::timeout, this, &DjlibService::requestPass);
+    connect(&m_safetyTimer, &QTimer::timeout, this, &DjlibService::reprobeDeferred);
     // One queue item per event-loop turn.
     m_queueTimer.setSingleShot(true);
     m_queueTimer.setInterval(0);
@@ -563,6 +569,7 @@ void DjlibService::rearm() {
     commitUnsaved();
     m_unsaved.clear();
     m_failedItems.clear();
+    m_probed.clear();
     m_tracksDirMissing = false;
     m_libraryDirMissing = false;
     m_confirmTimer.stop();
@@ -770,7 +777,8 @@ void DjlibService::startMembershipJob(const QSet<QString>& crateIds) {
 
 void DjlibService::startProbe(const TrackPointer& pTrack) {
     const TrackId trackId = pTrack->getId();
-    if (!trackId.isValid() || m_probing.contains(trackId) || m_probed.contains(trackId)) {
+    if (!trackId.isValid() || m_probing.contains(trackId) ||
+            m_probed.value(trackId) >= kMaxProbeAttempts) {
         return;
     }
     m_probing.insert(trackId);
@@ -791,7 +799,7 @@ void DjlibService::startProbe(const TrackPointer& pTrack) {
             .then(this, [this, trackId] {
                 --m_jobsRunning;
                 m_probing.remove(trackId);
-                m_probed.insert(trackId);
+                ++m_probed[trackId];
                 for (auto it = m_deferred.constBegin(); it != m_deferred.constEnd(); ++it) {
                     if (it->trackId == trackId) {
                         enqueue(Item{Item::Kind::Retry, it.key(), {}, {}, {}, false});
@@ -799,6 +807,21 @@ void DjlibService::startProbe(const TrackPointer& pTrack) {
                 }
                 checkIdle();
             });
+}
+
+void DjlibService::reprobeDeferred() {
+    if (m_scanRunning) {
+        return;
+    }
+    for (auto it = m_deferred.constBegin(); it != m_deferred.constEnd(); ++it) {
+        if (!it->needsSampleRate || !m_probed.contains(it->trackId)) {
+            continue; // waits for a deck unload, or its first probe is running
+        }
+        const TrackPointer pTrack = m_pTrackCollectionManager->getTrackById(it->trackId);
+        if (pTrack && !isTrackLoaded(pTrack)) {
+            startProbe(pTrack);
+        }
+    }
 }
 
 void DjlibService::scheduleReconcile() {
@@ -1058,6 +1081,7 @@ bool DjlibService::packageAdded(const QString& packageName) {
         kLogger.warning() << "Cannot add" << path;
         return false;
     }
+    m_probed.remove(pTrack->getId()); // new or replaced: worth opening again
     if (!pTrack->getSampleRate().isValid() && !isTrackLoaded(pTrack)) {
         startProbe(pTrack);
     }
@@ -1126,6 +1150,9 @@ bool DjlibService::sidecarChanged(const ParsedSidecar& parsed) {
         if (!m_store.upsertTrackState(state)) {
             return false;
         }
+    }
+    if (parsed.packageChanged) {
+        m_probed.remove(pTrack->getId()); // new or replaced: worth opening again
     }
     applyToTrack(pTrack, sidecar, packageName);
     return true;
@@ -1270,11 +1297,17 @@ void DjlibService::applyToTrack(const TrackPointer& pTrack,
     }
     if (result.hasDeferred()) {
         // Completed on deck unload (slotDeckTrackChanged) or after the probe.
-        m_deferred.insert(djlibId, Deferred{sidecar, trackId, packageName, result.baseline});
+        m_deferred.insert(djlibId,
+                Deferred{sidecar,
+                        trackId,
+                        packageName,
+                        result.baseline,
+                        result.needsSampleRate});
         if (result.needsSampleRate && !loaded) {
             if (m_probed.contains(trackId)) {
+                // Opened again by reprobeDeferred() or when the package changes.
                 kLogger.warning() << "Sample rate unknown for" << djlibId
-                                  << "- beats/cues wait for a deck load";
+                                  << "- beats/cues wait for a readable package or a deck load";
             } else {
                 startProbe(pTrack);
             }

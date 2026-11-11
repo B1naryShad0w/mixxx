@@ -248,6 +248,7 @@ class DjlibService : public QObject {
         TrackId trackId;
         QString packageName;
         DjlibImporter::Baseline baseline;
+        bool needsSampleRate = false; // else: waits for a deck unload
     };
 
     /// An applied sidecar whose track or row could not be written yet. Holds
@@ -266,6 +267,7 @@ class DjlibService : public QObject {
     void onPassFinished(djlib::PassResult result);
     void startMembershipJob(const QSet<QString>& crateIds);
     void startProbe(const TrackPointer& pTrack);
+    void reprobeDeferred();
 
     void enqueue(Item item);
     void processNext();
@@ -345,7 +347,7 @@ class DjlibService : public QObject {
     QHash<QString, Unsaved> m_unsaved; // djlib id -> write to repeat
     QHash<QString, Deferred> m_deferred; // djlib id -> sidecar
     QSet<TrackId> m_probing;
-    QSet<TrackId> m_probed;
+    QHash<TrackId, int> m_probed; // probes done since the package changed
 
     QDateTime m_lastImport;
     QString m_lastImportFile;
