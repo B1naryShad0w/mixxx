@@ -203,6 +203,21 @@ jobs:
           CTEST_PARALLEL_LEVEL: 1
           CTEST_OUTPUT_ON_FAILURE: 1
 
+      - name: "Report failed tests"
+        # Annotations can be read without signing in, the job log cannot.
+        if: failure()
+        shell: pwsh
+        working-directory: build
+        run: |
+          $log = "Testing/Temporary/LastTest.log"
+          if (Test-Path $log) {
+            Select-String -Path $log -Pattern ': error: |: Failure|\*\*\*Timeout|\*\*\*Failed|\*\*\*Exception|\[  FAILED  \] Djlib' -Context 0,6 |
+              Select-Object -First 9 | ForEach-Object {
+                $t = ((@($_.Line) + $_.Context.PostContext) -join '%0A') -replace "\x1b\[[0-9;]*m", ""
+                Write-Output "::error::$t"
+              }
+          }
+
       - name: "Install WiX Toolset"
         shell: pwsh
         run: |

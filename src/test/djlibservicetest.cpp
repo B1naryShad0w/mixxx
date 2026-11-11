@@ -1355,6 +1355,10 @@ TEST_F(DjlibServiceTest, folderChosenInAnotherSpellingIsNotRearmed) {
 }
 
 TEST_F(DjlibServiceTest, sameFolderReachedByAnotherPathKeepsTheLibraryEntries) {
+#ifdef Q_OS_WIN
+    // QFile::link makes a .lnk shortcut on Windows, not a second path to the folder.
+    GTEST_SKIP() << "needs a symbolic link";
+#endif
     // The library folder is known by two paths (a link here; on Windows
     // also another case, a junction, a mapped drive).
     QTemporaryDir linkDir;
@@ -1421,6 +1425,10 @@ TEST_F(DjlibServiceTest, sameFolderReachedByAnotherPathKeepsTheLibraryEntries) {
 }
 
 TEST_F(DjlibServiceTest, agentNamingTheSameFolderDifferentlyChangesNothing) {
+#ifdef Q_OS_WIN
+    // QFile::link makes a .lnk shortcut on Windows, not a second path to the folder.
+    GTEST_SKIP() << "needs a symbolic link";
+#endif
     m_safetyPassMillis = 300;
     QTemporaryDir linkDir;
     ASSERT_TRUE(linkDir.isValid());
